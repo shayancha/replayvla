@@ -22,6 +22,10 @@
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
 export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
+export TF_CPP_MIN_LOG_LEVEL=3   # hide TF C++ startup noise ("Unable to register cuDNN factory", ...)
+# TF's graph optimizer also prints harmless "op_level_cost_estimator ... Error in PredictCost()" warnings via a logger
+# that TF_CPP_MIN_LOG_LEVEL does not control; drop just those lines from stderr (see torchrun below)
+TF_NOISE="op_level_cost_estimator|PredictCost"
 if [[ "${CONDA_DEFAULT_ENV:-}" != "${CONDA_ENV_NAME:-replayvla}" ]] || ! command -v torchrun >/dev/null; then
   echo "ERROR: conda env ${CONDA_ENV_NAME:-replayvla} not active (CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-none}); see slurm_scripts/common.sh"
   exit 1
@@ -66,7 +70,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NUM_GPUS" vla-scripts/train_
     --stop_file "$STOP_FILE" \
     --checkpoint_interval_minutes "$CHECKPOINT_MIN" \
     --wandb_mode "$WANDB_MODE" \
-    "$@" &
+    "$@" 2> >(grep --line-buffered -v -E "$TF_NOISE" >&2) &
 TRAIN_PID=$!
 
 # `wait` returns early whenever a trapped signal arrives; keep waiting until training has actually exited

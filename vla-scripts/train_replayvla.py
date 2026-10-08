@@ -17,6 +17,7 @@ Run with:
 
 import json
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -107,6 +108,7 @@ class ReplayTrainConfig:
     wandb_project: str = "replayvla"
     wandb_entity: Optional[str] = None
     wandb_mode: str = "online"                                      # "offline" if compute nodes have no internet
+    log_every: int = 50                                             # Plain-text progress line every N steps (rank 0)
     run_id_note: Optional[str] = None
     # fmt: on
 
@@ -164,10 +166,12 @@ def train(cfg: ReplayTrainConfig) -> None:
     optimizer_state = None
     if resume_ckpt is not None:
         vla, optimizer_state, trainer_state = load_resume_checkpoint(vla, resume_ckpt)
-        print(f"Resuming from {resume_ckpt} at step {trainer_state['completed_steps']}")
+        if distributed_state.is_main_process:
+            print(f"Resuming from {resume_ckpt} at step {trainer_state['completed_steps']}", flush=True)
     else:
         vla = wrap_with_lora(vla, rank=cfg.lora_rank, dropout=cfg.lora_dropout)
-    vla.print_trainable_parameters()
+    if distributed_state.is_main_process:
+        vla.print_trainable_parameters()
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
     optimizer = AdamW([p for p in vla.parameters() if p.requires_grad], lr=cfg.learning_rate)
@@ -228,11 +232,14 @@ def train(cfg: ReplayTrainConfig) -> None:
         dist.barrier()
 
     recent = {k: deque(maxlen=cfg.grad_accumulation_steps) for k in ("loss", "action_accuracy", "l1_loss")}
-    last_checkpoint_time = time.time()
+    window = {"loss": 0.0, "action_accuracy": 0.0, "l1_loss": 0.0, "memory_frames": 0.0, "n": 0}
+    last_checkpoint_time = last_log_time = time.time()
+    last_log_step = completed_steps
 
     # Note: the RLDS stream is not resumed position-exactly (it is an infinite shuffled stream); a resumed job just
     # continues with fresh shuffled data, which is equivalent in expectation.
-    with tqdm.tqdm(initial=completed_steps, total=cfg.max_steps, leave=False) as progress:
+    show_bar = distributed_state.is_main_process and sys.stderr.isatty()
+    with tqdm.tqdm(initial=completed_steps, total=cfg.max_steps, leave=False, disable=not show_bar) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -247,6 +254,11 @@ def train(cfg: ReplayTrainConfig) -> None:
             recent["loss"].append(loss.item())
             recent["action_accuracy"].append(metrics["action_accuracy"])
             recent["l1_loss"].append(metrics["l1_loss"])
+            for key, value in (("loss", loss.item()), ("action_accuracy", metrics["action_accuracy"]),
+                               ("l1_loss", metrics["l1_loss"]),
+                               ("memory_frames", inputs["memory_valid"].sum(1).float().mean().item())):
+                window[key] += value
+            window["n"] += 1
 
             if (batch_idx + 1) % cfg.grad_accumulation_steps != 0:
                 continue
@@ -255,6 +267,21 @@ def train(cfg: ReplayTrainConfig) -> None:
             optimizer.zero_grad()
             completed_steps += 1
             progress.update()
+
+            if distributed_state.is_main_process and completed_steps % cfg.log_every == 0 and window["n"] > 0:
+                now = time.time()
+                sec_per_step = (now - last_log_time) / max(1, completed_steps - last_log_step)
+                eta_h = sec_per_step * (cfg.max_steps - completed_steps) / 3600
+                n = window["n"]
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] step {completed_steps}/{cfg.max_steps} | "
+                    f"loss {window['loss'] / n:.4f} | action acc {window['action_accuracy'] / n:.3f} | "
+                    f"L1 {window['l1_loss'] / n:.4f} | mem frames {window['memory_frames'] / n:.1f} | "
+                    f"{sec_per_step:.2f} s/step | ETA {int(eta_h)}h{int((eta_h % 1) * 60):02d}m",
+                    flush=True,
+                )
+                window = {k: 0.0 for k in window} | {"n": 0}
+                last_log_time, last_log_step = now, completed_steps
 
             if distributed_state.is_main_process and completed_steps % 10 == 0:
                 log = {("train_loss" if k == "loss" else k): sum(v) / len(v) for k, v in recent.items()}
