@@ -1,6 +1,7 @@
 # Running ReplayVLA on the Duke Compute Cluster (DCC)
 
-Guide covers setting up and running ReplayVLA, and a plain OpenVLA baseline, on DCC's H200 GPUs via Slurm. It goes from a fresh account to a training run and a LIBERO evaluation. 
+Guide covers setting up and running ReplayVLA, and a plain OpenVLA baseline, on DCC's H200 GPUs via Slurm. It goes from a fresh account to a training run and a LIBERO evaluation.
+
 ---
 
 ## 1. Storage layout (all under `/work/$USER`)
