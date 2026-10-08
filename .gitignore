@@ -151,3 +151,8 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+papers/
+planning/
+AGENTS.md
+TRAINING_JOB_SUBMISSIONS

@@ -20,7 +20,7 @@ Guide covers setting up and running ReplayVLA, and a plain OpenVLA baseline, on 
 
 ---
 
-## 2. Get an interactive compute shell for setup
+## 2. Get interactive shell for setup
 
 From a DCC login node:
 ```bash
@@ -29,7 +29,7 @@ srun -p interactive --cpus-per-task=8 --mem=32G --time=4:00:00 --pty bash -l
 
 ---
 
-## 3. Clone the code
+## 3. Clone code
 
 ```bash
 cd /work/$USER
@@ -40,12 +40,11 @@ cd replayvla
 
 ---
 
-## 4. Create the environment 
+## 4. Create environment 
 
 ```bash
 bash slurm_scripts/setup_env.sh
 ```
-This runs `module load Anaconda3/2024.02`, creates the conda env `replayvla` (Python 3.10) in `/work/$USER/.conda/envs`, runs `pip install -e .` (torch 2.2.0, transformers 4.40.1, TF 2.15, …), and pins `tensorflow-metadata==1.17.1 protobuf==4.21.12`. It finishes with `pip check` and an import test.
 
 To use the env in your own shell later:
 ```bash
@@ -57,7 +56,6 @@ source slurm_scripts/common.sh
 ```bash
 bash slurm_scripts/download_assets.sh
 ```
-This downloads `openvla/openvla-7b` (15 GB) into the HF cache and `libero_10_no_noops` (3.5 GB) from `openvla/modified_libero_rlds`.
 
 ## 6. Run the tests (CPU)
 
@@ -103,10 +101,10 @@ cd /work/$USER/replayvla
 AUTO_RESUBMIT=1 RUN_NOTE=baseline sbatch slurm_scripts/train_replayvla.sbatch --use_memory False
 ```
 
-- `AUTO_RESUBMIT=1`: when a job hits the 24 h limit, it checkpoints and resubmits itself, until `max_steps` (at most `MAX_RESUBMITS`, default 10).
-- `RUN_NOTE` names the run and its STOP file. **Use a different note for each concurrent run** (default `main`).
+- `AUTO_RESUBMIT=1`: when a job hits the 24 h limit, it checkpoints and resubmits itself.
+- `RUN_NOTE` names the run and its STOP file. Use a different note for each concurrent run (default `main`).
 - Any training option goes after the script name, e.g. `... train_replayvla.sbatch --max_steps 30000 --batch_size 6`. See `ReplayTrainConfig` in `vla-scripts/train_replayvla.py`, or `python vla-scripts/train_replayvla.py --help`.
-- Speed: ReplayVLA ~2.8 s/step on 2× H200 (≈38 h for 50k steps, i.e. 2 chained jobs). The baseline is faster, since its sequences are much shorter.
+- Speed: ReplayVLA ~2.8 s/step on 2× H200 (≈38 h for 50k steps, i.e. 2 chained jobs). The baseline is faster.
 
 ### How a run survives the 24 h limit and preemption
 - A **resumable checkpoint** (LoRA + memory modules + optimizer + step) is written every 30 min (`--checkpoint_interval_minutes`). It is also written when the job gets SIGTERM (preemption: ~30 s warning), and 15 min before the time limit (SIGUSR1 → STOP file). 
