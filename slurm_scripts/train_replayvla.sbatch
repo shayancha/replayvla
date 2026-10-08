@@ -3,8 +3,8 @@
 #SBATCH --account=scavenger-h200
 #SBATCH --partition=scavenger-h200
 #SBATCH --gres=gpu:h200:2
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=48                # 24 per GPU (H200 nodes: 192 CPUs / 8 GPUs); data loading is CPU-heavy
+#SBATCH --mem=256G
 #SBATCH --time=24:00:00
 #SBATCH --requeue                       # preemption = cancel + requeue: the requeued job resumes from the checkpoint
 #SBATCH --signal=B:USR1@900             # 15 min before the time limit, SIGUSR1 to this script -> checkpoint + exit
@@ -22,8 +22,19 @@
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
 export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
+if [[ "${CONDA_DEFAULT_ENV:-}" != "${CONDA_ENV_NAME:-replayvla}" ]] || ! command -v torchrun >/dev/null; then
+  echo "ERROR: conda env ${CONDA_ENV_NAME:-replayvla} not active (CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-none}); see slurm_scripts/common.sh"
+  exit 1
+fi
 
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-2}
+# Each rank runs its own TF data pipeline + PyTorch. Without caps, both size their thread pools for the whole node
+# (192 cores) and fight over the job's CPUs: job 58128414 ran at 15 s/step with one GPU idle. Cap per rank.
+CPUS_PER_RANK=$(( ${SLURM_CPUS_PER_TASK:-16} / NUM_GPUS ))
+export OMP_NUM_THREADS=$(( CPUS_PER_RANK / 4 > 1 ? CPUS_PER_RANK / 4 : 1 ))
+export TF_NUM_INTRAOP_THREADS=$CPUS_PER_RANK
+export TF_NUM_INTEROP_THREADS=$(( CPUS_PER_RANK / 4 > 1 ? CPUS_PER_RANK / 4 : 1 ))
+echo "[$(date)] $NUM_GPUS GPUs, ${SLURM_CPUS_PER_TASK:-?} CPUs: $CPUS_PER_RANK per rank (OMP=$OMP_NUM_THREADS, TF intra=$TF_NUM_INTRAOP_THREADS inter=$TF_NUM_INTEROP_THREADS)"
 CHECKPOINT_MIN=${CHECKPOINT_MIN:-30}
 RESUBMIT_COUNT=${RESUBMIT_COUNT:-0}
 MAX_RESUBMITS=${MAX_RESUBMITS:-10}

@@ -139,6 +139,8 @@ def train(cfg: ReplayTrainConfig) -> None:
         exp_id += "--image_aug"
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
+    if distributed_state.is_main_process:  # memory settings, needed to rebuild the base when merging/evaluating
+        (run_dir / "replayvla_config.json").write_text(json.dumps({"vla_path": cfg.vla_path, **cfg.memory_kwargs()}, indent=2))
 
     # Register OpenVLA + ReplayVLA with HF Auto classes (processor loading; no remote code needed)
     AutoConfig.register("openvla", OpenVLAConfig)
