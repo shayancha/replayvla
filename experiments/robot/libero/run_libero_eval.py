@@ -58,12 +58,13 @@ class GenerateConfig:
     #################################################################################################################
     # Model-specific parameters
     #################################################################################################################
-    model_family: str = "openvla"                    # Model family
+    model_family: str = "openvla"                    # Model family ("openvla" or "replayvla" = OpenVLA + memory)
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
+    noop_threshold: Optional[float] = None           # (ReplayVLA) drop near-no-op steps from memory, as in *_no_noops
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -104,7 +105,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     model = get_model(cfg)
 
     # [OpenVLA] Check that the model contains the action un-normalization key
-    if cfg.model_family == "openvla":
+    if cfg.model_family in ("openvla", "replayvla"):
         # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
         # with the suffix "_no_noops" in the dataset name)
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
@@ -113,7 +114,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
-    if cfg.model_family == "openvla":
+    if cfg.model_family in ("openvla", "replayvla"):
         processor = get_processor(cfg)
 
     # Initialize local logging
@@ -166,6 +167,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
+            if cfg.model_family == "replayvla":
+                model.replay_buffer.reset()  # new episode: empty memory, anchor = first frame the policy sees
 
             # Setup
             t = 0
@@ -221,7 +224,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
                     # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
-                    if cfg.model_family == "openvla":
+                    if cfg.model_family in ("openvla", "replayvla"):
                         action = invert_gripper_action(action)
 
                     # Execute action in environment

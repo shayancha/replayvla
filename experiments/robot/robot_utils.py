@@ -41,6 +41,10 @@ def get_model(cfg, wrap_diffusion_policy_for_droid=False):
     """Load model for evaluation."""
     if cfg.model_family == "openvla":
         model = get_vla(cfg)
+    elif cfg.model_family == "replayvla":
+        from memory_bank.inference import get_replayvla  # OpenVLA + memory (memory_bank/)
+
+        model = get_replayvla(cfg)
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     print(f"Loaded model: {type(model)}")
@@ -53,7 +57,7 @@ def get_image_resize_size(cfg):
     If `resize_size` is an int, then the resized image will be a square.
     Else, the image will be a rectangle.
     """
-    if cfg.model_family == "openvla":
+    if cfg.model_family in ("openvla", "replayvla"):
         resize_size = 224
     else:
         raise ValueError("Unexpected `model_family` found in config.")
@@ -66,6 +70,11 @@ def get_action(cfg, model, obs, task_label, processor=None):
         action = get_vla_action(
             model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
         )
+        assert action.shape == (ACTION_DIM,)
+    elif cfg.model_family == "replayvla":
+        from memory_bank.inference import get_replayvla_action
+
+        action = get_replayvla_action(model, processor, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop)
         assert action.shape == (ACTION_DIM,)
     else:
         raise ValueError("Unexpected `model_family` found in config.")
