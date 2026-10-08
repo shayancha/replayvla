@@ -115,3 +115,86 @@ def batch_to_model_inputs(batch: Dict, device: Union[int, torch.device], dtype: 
         value = batch[key].to(device)
         inputs[key] = value.to(dtype) if key in PIXEL_KEYS else value
     return inputs
+
+
+# === Resumable checkpoints (preemption / time-limit safe) ===
+# Layout: <run_dir>/resume/{adapter/, optimizer.pt, trainer_state.json}. Written to resume.tmp and swapped in with
+# renames, so a job killed mid-save always leaves the previous complete checkpoint behind.
+RESUME_DIR, RESUME_TMP, RESUME_OLD = "resume", "resume.tmp", "resume.old"
+
+
+def save_resume_checkpoint(peft_model, optimizer, trainer_state: Dict, run_dir: Union[str, Path]) -> Path:
+    import json
+    import shutil
+
+    run_dir = Path(run_dir)
+    tmp, final, old = run_dir / RESUME_TMP, run_dir / RESUME_DIR, run_dir / RESUME_OLD
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    peft_model.save_pretrained(tmp / "adapter")                  # LoRA weights + memory modules (modules_to_save)
+    torch.save(optimizer.state_dict(), tmp / "optimizer.pt")
+    (tmp / "trainer_state.json").write_text(json.dumps(trainer_state))
+    (tmp / "COMPLETE").touch()                                   # only complete checkpoints are ever resumed from
+    shutil.rmtree(old, ignore_errors=True)
+    if final.exists():
+        final.rename(old)
+    tmp.rename(final)
+    shutil.rmtree(old, ignore_errors=True)
+    return final
+
+
+def find_resume_checkpoint(run_dir: Union[str, Path]) -> Optional[Path]:
+    """Newest complete checkpoint, also covering a kill between the two renames (then only resume.old exists)."""
+    for name in (RESUME_DIR, RESUME_OLD):
+        path = Path(run_dir) / name
+        if (path / "COMPLETE").exists():
+            return path
+    return None
+
+
+def load_resume_checkpoint(base_model: ReplayVLAForActionPrediction, checkpoint: Union[str, Path]):
+    """Returns (trainable PeftModel with restored LoRA + memory modules, optimizer state dict, trainer state)."""
+    import json
+
+    checkpoint = Path(checkpoint)
+    peft_model = PeftModel.from_pretrained(base_model, str(checkpoint / "adapter"), is_trainable=True)
+    optimizer_state = torch.load(checkpoint / "optimizer.pt", map_location="cpu")
+    trainer_state = json.loads((checkpoint / "trainer_state.json").read_text())
+    return peft_model, optimizer_state, trainer_state
+
+
+class StopRequest:
+    """
+    Turns SLURM's "about to stop" signals into a clean checkpoint-and-exit, agreed on by all ranks.
+
+      - SIGTERM: preemption / scancel (Slurm sends it to every process; ~30 s before SIGKILL by default)
+      - SIGUSR1: time-limit warning, e.g. `#SBATCH --signal=B:USR1@900` forwarded by the batch script
+      - a stop file (the batch script touches it on any signal; works even if the signal misses a worker)
+    Call `local_request()` once per step and combine it across ranks with `sync_any`, so every rank stops at the
+    same step.
+    """
+
+    def __init__(self, stop_file: Optional[Union[str, Path]] = None) -> None:
+        import signal
+
+        self.requested, self.reason = False, None
+        self.stop_file = Path(stop_file) if stop_file else None
+        for sig in (signal.SIGTERM, signal.SIGUSR1):
+            signal.signal(sig, self._handler)
+
+    def _handler(self, signum, frame) -> None:
+        self.requested, self.reason = True, f"signal {signum}"
+
+    def local_request(self) -> bool:
+        if not self.requested and self.stop_file is not None and self.stop_file.exists():
+            self.requested, self.reason = True, f"stop file {self.stop_file}"
+        return self.requested
+
+
+def sync_any(flags: List[bool], device=None) -> List[bool]:
+    """Element-wise OR of boolean flags across all ranks (so every rank takes the same branch). No-op without DDP."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        tensor = torch.tensor([1.0 if f else 0.0 for f in flags], device=device)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+        return [bool(v > 0) for v in tensor.tolist()]
+    return list(flags)

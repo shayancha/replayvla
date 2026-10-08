@@ -15,7 +15,9 @@ Run with:
         --data_root_dir <PATH/TO/RLDS/DATASETS> --dataset_name libero_10_no_noops --run_root_dir <PATH/TO/RUNS> ...
 """
 
+import json
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,10 +37,15 @@ import wandb
 from memory_bank.data import ReplayCollator, ReplayRLDSBatchTransform, ReplayRLDSDataset
 from memory_bank.modeling import register_replayvla
 from memory_bank.training import (
+    StopRequest,
     action_metrics,
     batch_to_model_inputs,
+    find_resume_checkpoint,
     load_replayvla,
+    load_resume_checkpoint,
     merge_lora,
+    save_resume_checkpoint,
+    sync_any,
     upcast_memory_modules,
     wrap_with_lora,
 )
@@ -85,6 +92,12 @@ class ReplayTrainConfig:
     merge_on_save: bool = True                                      # Merge LoRA into a full ReplayVLA at each save
     gradient_checkpointing: bool = True                             # LLM activation checkpointing
     gist_gradient_checkpointing: bool = False                       # Gist encoder activation checkpointing
+
+    # Preemption / time-limit safety (SLURM)
+    resume: bool = True                                             # Resume from <run_dir>/resume if it exists
+    checkpoint_interval_minutes: float = 30.0                       # Periodic resumable checkpoint (safety net)
+    stop_file: Optional[Path] = None                                # Touched by the batch script on SIGTERM/SIGUSR1;
+                                                                    #   default: <run_dir>/STOP
 
     # LoRA Arguments
     lora_rank: int = 32
@@ -143,11 +156,32 @@ def train(cfg: ReplayTrainConfig) -> None:
     vla.gist_encoder.gradient_checkpointing = cfg.gist_gradient_checkpointing
     vla = vla.to(device_id)
 
-    vla = wrap_with_lora(vla, rank=cfg.lora_rank, dropout=cfg.lora_dropout)
+    # Resume (LoRA + memory modules + optimizer + step) if a complete checkpoint exists, else start fresh
+    resume_ckpt = find_resume_checkpoint(run_dir) if cfg.resume else None
+    trainer_state = {"completed_steps": 0, "wandb_run_id": None}
+    optimizer_state = None
+    if resume_ckpt is not None:
+        vla, optimizer_state, trainer_state = load_resume_checkpoint(vla, resume_ckpt)
+        print(f"Resuming from {resume_ckpt} at step {trainer_state['completed_steps']}")
+    else:
+        vla = wrap_with_lora(vla, rank=cfg.lora_rank, dropout=cfg.lora_dropout)
     vla.print_trainable_parameters()
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
     optimizer = AdamW([p for p in vla.parameters() if p.requires_grad], lr=cfg.learning_rate)
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    completed_steps = trainer_state["completed_steps"]
+    if completed_steps >= cfg.max_steps:
+        print(f"Already finished ({completed_steps} >= {cfg.max_steps} steps)")
+        return
+    if distributed_state.is_main_process and (run_dir / "DONE").exists():
+        (run_dir / "DONE").unlink()  # max_steps was raised since the last run
+
+    stop = StopRequest(cfg.stop_file or run_dir / "STOP")
+    if distributed_state.is_main_process and stop.stop_file.exists():
+        stop.stop_file.unlink()  # stale request from the previous job
+    dist.barrier()
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     batch_transform = ReplayRLDSBatchTransform(
@@ -176,12 +210,27 @@ def train(cfg: ReplayTrainConfig) -> None:
     dataloader = DataLoader(vla_dataset, batch_size=cfg.batch_size, sampler=None, collate_fn=collator, num_workers=0)
 
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}", mode=cfg.wandb_mode,
-                   config={k: str(v) if isinstance(v, Path) else v for k, v in vars(cfg).items()})
+        run = wandb.init(
+            entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}", mode=cfg.wandb_mode,
+            id=trainer_state.get("wandb_run_id"), resume="allow",
+            config={k: str(v) if isinstance(v, Path) else v for k, v in vars(cfg).items()},
+        )
+        trainer_state["wandb_run_id"] = run.id
+
+    def checkpoint(reason: str) -> None:
+        if distributed_state.is_main_process:
+            start = time.time()
+            state = dict(trainer_state, completed_steps=completed_steps, reason=reason, time=time.time())
+            path = save_resume_checkpoint(vla.module, optimizer, state, run_dir)
+            print(f"[step {completed_steps}] resumable checkpoint ({reason}) -> {path} in {time.time() - start:.1f}s")
+        dist.barrier()
 
     recent = {k: deque(maxlen=cfg.grad_accumulation_steps) for k in ("loss", "action_accuracy", "l1_loss")}
+    last_checkpoint_time = time.time()
 
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    # Note: the RLDS stream is not resumed position-exactly (it is an infinite shuffled stream); a resumed job just
+    # continues with fresh shuffled data, which is equivalent in expectation.
+    with tqdm.tqdm(initial=completed_steps, total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -197,26 +246,40 @@ def train(cfg: ReplayTrainConfig) -> None:
             recent["action_accuracy"].append(metrics["action_accuracy"])
             recent["l1_loss"].append(metrics["l1_loss"])
 
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+            if (batch_idx + 1) % cfg.grad_accumulation_steps != 0:
+                continue
+
+            optimizer.step()
+            optimizer.zero_grad()
+            completed_steps += 1
+            progress.update()
+
+            if distributed_state.is_main_process and completed_steps % 10 == 0:
                 log = {("train_loss" if k == "loss" else k): sum(v) / len(v) for k, v in recent.items()}
                 log["memory_frames_per_example"] = inputs["memory_valid"].sum(1).float().mean().item()
-                wandb.log(log, step=gradient_step_idx)
+                wandb.log(log, step=completed_steps)
 
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                progress.update()
+            # All ranks agree on: stop requested (SIGTERM / SIGUSR1 / stop file)?  periodic checkpoint due?
+            due = time.time() - last_checkpoint_time > cfg.checkpoint_interval_minutes * 60
+            stop_now, due = sync_any([stop.local_request(), due], device=device_id)
+            finished = completed_steps >= cfg.max_steps
 
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0 and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-                save_checkpoint(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, gradient_step_idx, distributed_state)
-
-            if gradient_step_idx == cfg.max_steps:
+            if stop_now or due or finished:
+                checkpoint("stop requested" if stop_now else "finished" if finished else "periodic")
+                last_checkpoint_time = time.time()
+            if completed_steps % cfg.save_steps == 0 or finished:
+                save_merged(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, completed_steps, distributed_state)
+            if stop_now:
+                print(f"Stopping cleanly at step {completed_steps} ({stop.reason}); resume will pick up from here")
+                return
+            if finished:
+                if distributed_state.is_main_process:
+                    (run_dir / "DONE").write_text(json.dumps({"completed_steps": completed_steps}))
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
-                break
+                return
 
 
-def save_checkpoint(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, step, distributed_state) -> None:
+def save_merged(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, step, distributed_state) -> None:
     if distributed_state.is_main_process:
         print(f"Saving checkpoint for step {step}")
         processor.save_pretrained(run_dir)

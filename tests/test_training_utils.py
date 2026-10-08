@@ -168,6 +168,80 @@ def test_gradient_checkpointing_with_lora():
     print(f"   (HF gradient_checkpointing_enable flipped the gist encoder flag: {flipped})")
 
 
+def test_resume_checkpoint_round_trip():
+    """Save mid-training, resume into a fresh base: identical weights, optimizer state, and next step."""
+    from memory_bank.training import find_resume_checkpoint, load_resume_checkpoint, save_resume_checkpoint
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir, run_dir = Path(tmp) / "base", Path(tmp) / "run"
+        save_tiny_openvla(base_dir)
+        run_dir.mkdir()
+        inp = labelled_inputs()
+
+        def fresh_base():
+            m = load_replayvla(base_dir, memory_kwargs=MEMORY_KWARGS, torch_dtype=torch.float32)
+            upcast_memory_modules(m)
+            return m
+
+        def step(model, opt):
+            model.train()
+            loss = model(**inp).loss
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        torch.manual_seed(0)
+        vla = wrap_with_lora(fresh_base(), rank=4)
+        opt = torch.optim.AdamW([p for p in vla.parameters() if p.requires_grad], lr=1e-2)
+        for _ in range(2):
+            step(vla, opt)
+        save_resume_checkpoint(vla, opt, {"completed_steps": 2, "wandb_run_id": "abc"}, run_dir)
+
+        # A job killed mid-save leaves a partial resume.tmp; it must be ignored
+        (run_dir / "resume.tmp").mkdir()
+        assert find_resume_checkpoint(run_dir) == run_dir / "resume"
+
+        resumed, opt_state, state = load_resume_checkpoint(fresh_base(), find_resume_checkpoint(run_dir))
+        opt2 = torch.optim.AdamW([p for p in resumed.parameters() if p.requires_grad], lr=1e-2)
+        opt2.load_state_dict(opt_state)
+        assert state == {"completed_steps": 2, "wandb_run_id": "abc"}
+
+        a = {n: p for n, p in vla.named_parameters() if p.requires_grad}
+        b = {n: p for n, p in resumed.named_parameters() if p.requires_grad}
+        assert a.keys() == b.keys(), "trainable parameter sets differ after resume"
+        assert all(torch.equal(a[n], b[n]) for n in a), "weights differ after resume"
+
+        torch.manual_seed(1); step(vla, opt)
+        torch.manual_seed(1); step(resumed, opt2)
+        diff = max((a[n] - b[n]).abs().max().item() for n in a)
+        assert diff < 1e-5, f"the step after resuming differs from continuing (max diff {diff:.2e})"
+
+        # Second save swaps atomically; a kill between the two renames leaves only resume.old, which is still found
+        save_resume_checkpoint(vla, opt, {"completed_steps": 3}, run_dir)
+        (run_dir / "resume").rename(run_dir / "resume.old")
+        assert find_resume_checkpoint(run_dir) == run_dir / "resume.old"
+
+
+def test_stop_request_signals_and_file():
+    import os
+    import signal
+
+    from memory_bank.training import StopRequest, sync_any
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stop_file = Path(tmp) / "STOP"
+        req = StopRequest(stop_file)
+        assert not req.local_request()
+        stop_file.touch()
+        assert req.local_request() and "stop file" in req.reason
+        req2 = StopRequest(None)
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert req2.local_request() and "signal" in req2.reason
+        assert sync_any([True, False]) == [True, False]
+    for sig in (signal.SIGTERM, signal.SIGUSR1):  # restore defaults for the rest of the test run
+        signal.signal(sig, signal.SIG_DFL)
+
+
 TESTS = [v for k, v in dict(globals()).items() if k.startswith("test_")]
 
 if __name__ == "__main__":
