@@ -1,25 +1,6 @@
 # Running ReplayVLA on the Duke Compute Cluster (DCC)
 
-This guide covers setting up and running ReplayVLA, and the plain OpenVLA baseline it is compared against, on DCC's H200 GPUs via Slurm. It goes from a fresh account to a training run and a LIBERO evaluation. The model and design are described in `memory_bank/` and its docstrings. This guide is only about running things.
-
-Everything below uses **your own** NetID through `$USER`. Nothing is shared with other users' directories.
-
----
-
-## 0. Before you start
-
-| You need | How |
-|---|---|
-| A DCC account with SSH key login | [DCC login docs](https://oit-rc.pages.oit.duke.edu/rcsupportdocs/dcc/login/) |
-| Access to the `scavenger-h200` partition | Your faculty PI requests it ([H200 docs](https://oit-rc.pages.oit.duke.edu/rcsupportdocs/dcc/h200/)) |
-| ~40 GB free on `/work/$USER` | Conda env ~15 GB, OpenVLA-7B weights 15 GB, LIBERO-10 data 3.5 GB, plus checkpoints |
-
-**Limits that shape everything below:**
-- `scavenger-h200`: **max 2 H200s per user, 24 h max per job, preemptable** (jobs can be cancelled and requeued at any time). The training script checkpoints and resumes automatically.
-- Your account's total GPU allowance can be filled by one 2-GPU training job. While it runs, **other GPU jobs (e.g. LIBERO eval) queue with reason `AssocGrpGRES`** until it finishes.
-- **`/work` deletes files older than 75 days.** Keep code on GitHub, and copy checkpoints you want to keep somewhere persistent.
-- **Never run heavy commands on the login nodes** (`dcc-login`). Use them only for `sbatch`, `squeue`, `tail`, and editing files. Do setup in an interactive compute session (step 2).
-
+Guide covers setting up and running ReplayVLA, and a plain OpenVLA baseline, on DCC's H200 GPUs via Slurm. It goes from a fresh account to a training run and a LIBERO evaluation. 
 ---
 
 ## 1. Storage layout (all under `/work/$USER`)
@@ -44,7 +25,6 @@ From a DCC login node:
 ```bash
 srun -p interactive --cpus-per-task=8 --mem=32G --time=4:00:00 --pty bash -l
 ```
-Use `bash -l`, a **login** shell. It provides the `module` command that the setup scripts need. (`common.sh` can also initialize it itself, but setup is simplest this way.)
 
 ---
 
@@ -54,32 +34,31 @@ Use `bash -l`, a **login** shell. It provides the `module` command that the setu
 cd /work/$USER
 git clone https://github.com/shayancha/replayvla.git
 cd replayvla
-git checkout main      # or the feature branch, e.g. replayvla-memory, if it is not merged yet
 ```
-**Always run Slurm commands from this repo root.** The job scripts find the code through the directory you submit from.
+
 
 ---
 
-## 4. Create the environment (once, ~15 min)
+## 4. Create the environment 
 
 ```bash
 bash slurm_scripts/setup_env.sh
 ```
-This runs `module load Anaconda3/2024.02`, creates the conda env `replayvla` (Python 3.10) in `/work/$USER/.conda/envs`, runs `pip install -e .` (torch 2.2.0, transformers 4.40.1, TF 2.15, …), and pins `tensorflow-metadata==1.17.1 protobuf==4.21.12`. Without that pin, TF/wandb imports break. It finishes with `pip check` and an import test.
+This runs `module load Anaconda3/2024.02`, creates the conda env `replayvla` (Python 3.10) in `/work/$USER/.conda/envs`, runs `pip install -e .` (torch 2.2.0, transformers 4.40.1, TF 2.15, …), and pins `tensorflow-metadata==1.17.1 protobuf==4.21.12`. It finishes with `pip check` and an import test.
 
 To use the env in your own shell later:
 ```bash
 source slurm_scripts/common.sh
 ```
 
-## 5. Download the model and data (once, ~10 min)
+## 5. Download the model and data 
 
 ```bash
 bash slurm_scripts/download_assets.sh
 ```
-This downloads `openvla/openvla-7b` (15 GB) into the HF cache and `libero_10_no_noops` (3.5 GB) from `openvla/modified_libero_rlds`. DCC compute nodes have internet access, and both repos are public, so no login is needed.
+This downloads `openvla/openvla-7b` (15 GB) into the HF cache and `libero_10_no_noops` (3.5 GB) from `openvla/modified_libero_rlds`.
 
-## 6. Run the tests (~5 min, CPU)
+## 6. Run the tests (CPU)
 
 ```bash
 source slurm_scripts/common.sh
@@ -94,6 +73,20 @@ All files should print `N/N passed`.
 source slurm_scripts/common.sh && wandb login
 ```
 If you skip this, training logs **offline**. Upload later with `wandb sync /work/$USER/replayvla/wandb/offline-run-*`. The job scripts choose online/offline automatically.
+
+---
+
+## Setup is done: leave the interactive node
+
+Steps 2–7 are one-time setup, done inside the interactive session. When they're finished, end the session:
+```bash
+exit        # releases the interactive node; you're back on the login node
+```
+Submit all Slurm jobs (steps 8–10) **from the login node**. `sbatch`, `squeue`, `scancel` and `tail` on logs are lightweight and fine to run there. The jobs themselves run on the GPU nodes Slurm assigns, not on the login node. You don't need to activate the conda env first: each job script sets up its own environment via `slurm_scripts/common.sh`.
+
+Always `cd /work/$USER/replayvla` before `sbatch`. The job scripts find the code through the directory you submit from.
+
+You only need an interactive session again for heavier one-off commands: installing the LIBERO simulator (10a) and merging a checkpoint for eval (10b).
 
 ---
 
@@ -134,7 +127,7 @@ AUTO_RESUBMIT=1 RUN_NOTE=baseline sbatch slurm_scripts/train_replayvla.sbatch --
 - Speed: ReplayVLA ~2.8 s/step on 2× H200 (≈38 h for 50k steps, i.e. 2 chained jobs). The baseline is faster, since its sequences are much shorter.
 
 ### How a run survives the 24 h limit and preemption
-- A **resumable checkpoint** (LoRA + memory modules + optimizer + step) is written every 30 min (`--checkpoint_interval_minutes`). It is also written when the job gets SIGTERM (preemption: ~30 s warning), and 15 min before the time limit (SIGUSR1 → STOP file). Writes are atomic, so a kill mid-save never corrupts the last good checkpoint.
+- A **resumable checkpoint** (LoRA + memory modules + optimizer + step) is written every 30 min (`--checkpoint_interval_minutes`). It is also written when the job gets SIGTERM (preemption: ~30 s warning), and 15 min before the time limit (SIGUSR1 → STOP file). 
 - **Preemption:** Slurm requeues the job (`--requeue`), and it resumes from the checkpoint automatically.
 - **Time limit:** the job checkpoints, exits cleanly, and (with `AUTO_RESUBMIT=1`) submits the next one, which resumes.
 - A full merged model is also saved every 5,000 steps (`--save_steps`) into the run directory.
@@ -156,7 +149,7 @@ Every 50 steps the log prints a line like:
 
 ## 10. LIBERO evaluation
 
-### 10a. Install the simulator (once)
+### 10a. Install the simulator (once, in an interactive session: step 2)
 **Do not run this while one of your training jobs is running or queued.** It installs packages into the same env, and a job that starts mid-install can fail (this happened).
 ```bash
 source slurm_scripts/common.sh && bash slurm_scripts/setup_libero.sh
@@ -172,7 +165,7 @@ python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run>
 ```
 Or use the merged model saved every 5,000 steps in the run directory itself.
 
-### 10c. Run the eval (1 GPU, ≥24 GB)
+### 10c. Run the eval (1 GPU, ≥24 GB; submit from the login node)
 ```bash
 cd /work/$USER/replayvla
 sbatch slurm_scripts/eval_libero.sbatch /work/$USER/runs/<run>/merged-step<N> 50            # ReplayVLA, 50 trials/task
@@ -181,18 +174,3 @@ MODEL_FAMILY=openvla sbatch slurm_scripts/eval_libero.sbatch <baseline merged di
 It runs on a non-H200 GPU (`gpu:5000_ada`), so it doesn't use your H200 allowance. It may still wait while a training job holds your account's GPU limit. Results go to `/work/$USER/logs/libero_eval/EVAL-*.txt`, with per-task and total success rates. 50 trials × 10 tasks takes many hours; use e.g. `10` trials for a quick read.
 
 ---
-
-## 11. Known issues (all handled by the scripts; listed so you recognize them)
-
-| Symptom | Cause / fix |
-|---|---|
-| `libopenblas…so: cannot open shared object file` at job start | The conda env was being modified while the job imported numpy. **Don't pip install while jobs run.** |
-| `module: command not found` / `torchrun: command not found` | Submitted from a non-login shell. `common.sh` now initializes modules itself, and the job exits early with a clear error if the env isn't active. |
-| `OSError: [Errno 39] Directory not empty` (pip builds, tests, cleanup) | NFS on `/work` leaves `.nfs*` files when open files are deleted. Use `TMPDIR=/tmp` (the job scripts do). Checkpoint rotation tolerates it. |
-| `No module named 'libero'` | LIBERO has no top-level `__init__.py`. `common.sh` adds it to `PYTHONPATH` *after* `module load Anaconda3` (which overwrites `PYTHONPATH`). |
-| Training at ~15 s/step, one GPU idle | The two GPU processes' thread pools fought over the CPUs. The job script requests 48 CPUs and caps threads per rank. |
-| Eval/agent GPU jobs pending with `AssocGrpGRES` | Your account's GPU limit is in use by training. They start when it finishes. |
-| `Error in PredictCost() … CropAndResize` in logs | Harmless TensorFlow optimizer warning (filtered out of new job logs). |
-
-## 12. Using AI coding agents on DCC
-Follow DCC's [AI agent guide](https://oit-rc.pages.oit.duke.edu/rcsupportdocs/dcc/ai-access/) and AI use policy. Agents must never run commands on `dcc-login`; they use the `dcc-agent` / `dcc-agent-gpu` SSH aliases, which run on compute nodes. Keep approval prompts on, and confirm before deleting data, cancelling jobs, or submitting many jobs.
