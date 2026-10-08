@@ -62,35 +62,16 @@ This downloads `openvla/openvla-7b` (15 GB) into the HF cache and `libero_10_no_
 
 ```bash
 source slurm_scripts/common.sh
-export TMPDIR=/tmp      # temp dirs on /work (NFS) fail to clean up; see "Known issues"
+export TMPDIR=/tmp      # temp dirs on /work (NFS) fail to clean up
 for t in tests/test_*.py; do echo "$t: $(python $t 2>&1 | tail -1)"; done
 ```
 All files should print `N/N passed`.
 
-## 7. (Optional) Weights & Biases
-
-```bash
-source slurm_scripts/common.sh && wandb login
-```
-If you skip this, training logs **offline**. Upload later with `wandb sync /work/$USER/replayvla/wandb/offline-run-*`. The job scripts choose online/offline automatically.
+Now setup is done: leave the interactive node with `exit`. We submit training jobs from the login node.
 
 ---
 
-## Setup is done: leave the interactive node
-
-Steps 2–7 are one-time setup, done inside the interactive session. When they're finished, end the session:
-```bash
-exit        # releases the interactive node; you're back on the login node
-```
-Submit all Slurm jobs (steps 8–10) **from the login node**. `sbatch`, `squeue`, `scancel` and `tail` on logs are lightweight and fine to run there. The jobs themselves run on the GPU nodes Slurm assigns, not on the login node. You don't need to activate the conda env first: each job script sets up its own environment via `slurm_scripts/common.sh`.
-
-Always `cd /work/$USER/replayvla` before `sbatch`. The job scripts find the code through the directory you submit from.
-
-You only need an interactive session again for heavier one-off commands: installing the LIBERO simulator (10a) and merging a checkpoint for eval (10b).
-
----
-
-## 8. Smoke test (1× H200, ≤1.5 h): run this first
+## 7. Smoke test (1× H200, ≤1.5 h): run this first
 
 ```bash
 cd /work/$USER/replayvla
@@ -105,7 +86,7 @@ Expect ~3 s/step on one H200 at batch 8.
 
 ---
 
-## 9. Training
+## 8. Training
 
 Defaults: LIBERO-Long (`libero_10_no_noops`), **2× H200, batch 8 per GPU (16 total)**, lr 5e-4, LoRA r=32 on all pretrained linear layers, **50,000 steps**, 48 CPUs.
 
@@ -147,16 +128,16 @@ Every 50 steps the log prints a line like:
 
 ---
 
-## 10. LIBERO evaluation
+## 9. LIBERO evaluation
 
-### 10a. Install the simulator (once, in an interactive session: step 2)
+### 9a. Install the simulator (once, in an interactive session: step 2)
 **Do not run this while one of your training jobs is running or queued.** It installs packages into the same env, and a job that starts mid-install can fail (this happened).
 ```bash
 source slurm_scripts/common.sh && bash slurm_scripts/setup_libero.sh
 ```
 It clones LIBERO into `/work/$USER/LIBERO`, installs robosuite 1.4.1 and friends (pins `bddl==1.0.1`, `opencv-python==4.10.0.84`, `numpy==1.26.4`), and pre-writes LIBERO's config so it never prompts. `common.sh` puts LIBERO on `PYTHONPATH` and sets headless rendering (`MUJOCO_GL=egl`).
 
-### 10b. Make an evaluatable checkpoint
+### 9b. Make an evaluatable checkpoint
 Merge the run's latest resumable checkpoint into a standalone model. Run this in an interactive session with ≥32 GB RAM. It takes a few minutes and needs no GPU:
 ```bash
 source slurm_scripts/common.sh
@@ -165,7 +146,7 @@ python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run>
 ```
 Or use the merged model saved every 5,000 steps in the run directory itself.
 
-### 10c. Run the eval (1 GPU, ≥24 GB; submit from the login node)
+### 9c. Run the eval (1 GPU, ≥24 GB; submit from the login node)
 ```bash
 cd /work/$USER/replayvla
 sbatch slurm_scripts/eval_libero.sbatch /work/$USER/runs/<run>/merged-step<N> 50            # ReplayVLA, 50 trials/task
