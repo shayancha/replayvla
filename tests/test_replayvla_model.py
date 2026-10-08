@@ -134,7 +134,7 @@ def test_empty_slots_are_invisible():
 def test_memory_and_short_frames_are_used():
     model = make_model()
     with torch.no_grad():  # give role/gist pathways non-trivial weights so effects are visible
-        model.role_emb.normal_(std=0.02)
+        model.role_emb.weight.normal_(std=0.02)
     inp = make_inputs()
     base = run(model, **inp).logits[:, N_VISUAL:]
     for key, valid_key, seed in [("memory_pixel_values", "memory_valid", 4), ("short_pixel_values", "short_valid", 5)]:
@@ -183,7 +183,7 @@ def test_gradients_reach_memory_modules():
     labels = inp["input_ids"].clone()
     labels[:, :-4] = IGNORE_INDEX
     model(**inp, labels=labels).loss.backward()
-    for name in ["role_emb", "gist_projector.fc1.weight", "gist_encoder.gist_queries", "gist_encoder.in_proj.weight"]:
+    for name in ["role_emb.weight", "gist_projector.fc1.weight", "gist_encoder.gist_queries", "gist_encoder.in_proj.weight"]:
         grad = dict(model.named_parameters())[name].grad
         assert grad is not None and grad.abs().sum() > 0, f"{name} got no gradient"
 
@@ -200,7 +200,7 @@ def test_from_openvla_checkpoint_initializes_new_modules():
             model = ReplayVLAForActionPrediction.from_pretrained(tmp, config=replay_config(), low_cpu_mem_usage=low_cpu)
             sd, base = model.state_dict(), openvla.state_dict()
             assert all(torch.equal(sd[k], base[k]) for k in base), f"low_cpu={low_cpu}: OpenVLA weights not loaded"
-            assert torch.equal(model.role_emb, torch.zeros_like(model.role_emb)), f"low_cpu={low_cpu}: role_emb not zero"
+            assert torch.equal(model.role_emb.weight, torch.zeros_like(model.role_emb.weight)), f"low_cpu={low_cpu}: role_emb not zero"
             for name, mod in model.gist_encoder.named_modules():
                 if isinstance(mod, torch.nn.LayerNorm):
                     assert torch.equal(mod.weight, torch.ones_like(mod.weight)) and torch.equal(mod.bias, torch.zeros_like(mod.bias)), \

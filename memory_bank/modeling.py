@@ -60,6 +60,15 @@ class GistProjector(nn.Module):
         return self.fc2(self.act_fn(self.fc1(gists)))
 
 
+class RoleEmbeddings(nn.Module):
+    """Learned role vectors [anchor, short slot 0 … short slot n-1, gist], added to visual tokens; zero-init.
+    A module (not a bare Parameter) so PEFT's `modules_to_save` can train and save it alongside LoRA."""
+
+    def __init__(self, n_roles: int, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(n_roles, dim))
+
+
 class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
     config_class = ReplayVLAConfig
 
@@ -80,7 +89,7 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
         self.gist_projector = GistProjector(config.gist_dim, llm_dim)
 
         # Role embeddings: [anchor, short slot 0 … short slot n_short-2 (oldest → newest age), gist]; zero-init
-        self.role_emb = nn.Parameter(torch.zeros(1 + self.n_short_past + 1, llm_dim))
+        self.role_emb = RoleEmbeddings(1 + self.n_short_past + 1, llm_dim)
 
     # === Initialization of new parameters when loading an OpenVLA checkpoint (they show up as "missing keys") ===
     def _init_weights(self, module: nn.Module) -> None:
@@ -90,8 +99,8 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
             nn.init.zeros_(module.bias)
         elif isinstance(module, GistEncoder):
             nn.init.normal_(module.gist_queries, std=0.02)
-        if isinstance(module, ReplayVLAForActionPrediction) and hasattr(module, "role_emb"):
-            nn.init.zeros_(module.role_emb)
+        elif isinstance(module, RoleEmbeddings):
+            nn.init.zeros_(module.weight)
 
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any) -> "ReplayVLAForActionPrediction":
@@ -162,7 +171,7 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
 
         gists = self.gist_encoder(memory_features.to(anchor.dtype), memory_valid, memory_timesteps, anchor)  # [B, M, G, dg]
 
-        role = self.role_emb
+        role = self.role_emb.weight
         current_tokens = self.projector(current)                                              # [B, P, D]
         anchor_tokens = self.projector(anchor) + role[0]                                      # [B, P, D]
         short_tokens = self.projector(short) + role[1 : 1 + S][None, :, None, :]              # [B, S, P, D]
