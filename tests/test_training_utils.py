@@ -243,6 +243,55 @@ def test_stop_request_signals_and_file():
         signal.signal(sig, signal.SIG_DFL)
 
 
+def test_openvla_baseline_mode():
+    """--use_memory False: plain OpenVLA with the same LoRA recipe, metrics offset, merge and resume machinery."""
+    from memory_bank.training import find_resume_checkpoint, load_openvla, load_resume_checkpoint, save_resume_checkpoint
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir, adapter_dir, run_dir = Path(tmp) / "base", Path(tmp) / "adapter", Path(tmp) / "run"
+        save_tiny_openvla(base_dir)
+        run_dir.mkdir()
+        base = load_openvla(base_dir, torch_dtype=torch.float32)
+        assert type(base) is OpenVLAForActionPrediction
+        vla = wrap_with_lora(base, rank=4)
+        trainable = [n for n, p in vla.named_parameters() if p.requires_grad]
+        assert trainable and all("lora_" in n for n in trainable), "baseline should train LoRA only (no memory modules)"
+        # The training loop reads the visual-token count through DDP(PeftModel(...)).module
+        assert vla.vision_backbone.featurizer.patch_embed.num_patches == 196
+
+        inp = labelled_inputs()
+        batch = {k: inp[k] for k in ("input_ids", "attention_mask", "pixel_values", "labels")}
+        inputs = batch_to_model_inputs(batch, device="cpu", dtype=torch.float32)
+        assert set(inputs) == set(batch), "memory keys must be skipped when the batch has none"
+        opt = torch.optim.AdamW([p for p in vla.parameters() if p.requires_grad], lr=1e-2)
+        vla.train()
+        for _ in range(2):
+            loss = vla(**inputs).loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        out = vla(**inputs)
+        assert getattr(out, "num_visual_tokens", None) is None   # -> loop falls back to the patch count
+        # begin_idx 0: every labelled token counts as an "action" token, so the accuracy is never 0/0 = NaN
+        m = action_metrics(out.logits, inputs["labels"], 196, type("T", (), {"action_token_begin_idx": 0,
+                           "decode_token_ids_to_actions": staticmethod(lambda ids: ids.astype("float32"))})())
+        assert 0.0 <= m["action_accuracy"] <= 1.0, f"accuracy {m['action_accuracy']}"
+
+        vla.eval()
+        with torch.no_grad():
+            ref = vla(**inputs).logits
+        vla.save_pretrained(adapter_dir)
+        merged = merge_lora(base_dir, adapter_dir, use_memory=False, torch_dtype=torch.float32).eval()
+        assert type(merged) is OpenVLAForActionPrediction
+        with torch.no_grad():
+            assert torch.allclose(ref, merged(**inputs).logits, atol=1e-4), "merged baseline differs from LoRA model"
+
+        save_resume_checkpoint(vla, opt, {"completed_steps": 2}, run_dir)
+        resumed, opt_state, state = load_resume_checkpoint(load_openvla(base_dir, torch_dtype=torch.float32),
+                                                           find_resume_checkpoint(run_dir))
+        a = {n: p for n, p in vla.named_parameters() if p.requires_grad}
+        b = {n: p for n, p in resumed.named_parameters() if p.requires_grad}
+        assert a.keys() == b.keys() and all(torch.equal(a[n], b[n]) for n in a) and state["completed_steps"] == 2
+
+
 TESTS = [v for k, v in dict(globals()).items() if k.startswith("test_")]
 
 if __name__ == "__main__":

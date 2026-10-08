@@ -2,7 +2,8 @@
 train_replayvla.py
 
 LoRA fine-tuning of ReplayVLA (OpenVLA + MemoryWAM-style memory; see memory_bank/) on an RLDS dataset, forked from
-finetune.py. Differences from finetune.py:
+finetune.py. With `--use_memory False` it trains the plain OpenVLA baseline with the exact same loop, data, LoRA,
+logging and preemption-safe checkpointing (only the memory differs). Differences from finetune.py:
     - the model is ReplayVLAForActionPrediction, initialized from an OpenVLA checkpoint (memory modules start fresh)
     - LoRA on every pretrained linear layer (as finetune.py's "all-linear"); memory modules trained in full
       (PEFT modules_to_save) and kept in fp32
@@ -36,12 +37,15 @@ from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
 
 import wandb
 from memory_bank.data import ReplayCollator, ReplayRLDSBatchTransform, ReplayRLDSDataset
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from memory_bank.modeling import register_replayvla
 from memory_bank.training import (
     StopRequest,
     action_metrics,
     batch_to_model_inputs,
     find_resume_checkpoint,
+    load_openvla,
     load_replayvla,
     load_resume_checkpoint,
     merge_lora,
@@ -71,6 +75,7 @@ class ReplayTrainConfig:
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # LoRA weights before merging
 
     # Memory (memory_bank/configuration.py)
+    use_memory: bool = True                                         # False = plain OpenVLA baseline (same recipe)
     memory_stride: int = 8
     n_short: int = 4
     max_memory_frames: int = 64
@@ -122,7 +127,8 @@ class ReplayTrainConfig:
 
 @draccus.wrap()
 def train(cfg: ReplayTrainConfig) -> None:
-    print(f"Training ReplayVLA from `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    model_name = "ReplayVLA" if cfg.use_memory else "OpenVLA baseline (no memory)"
+    print(f"Training {model_name} from `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
     assert torch.cuda.is_available(), "Training assumes at least one GPU is available!"
     distributed_state = PartialState()
@@ -130,19 +136,21 @@ def train(cfg: ReplayTrainConfig) -> None:
     torch.cuda.empty_cache()
 
     exp_id = (
-        f"replayvla+{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+        f"{'replayvla' if cfg.use_memory else 'openvla-baseline'}+{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps * distributed_state.num_processes}"
         f"+lr-{cfg.learning_rate}+lora-r{cfg.lora_rank}"
-        f"+mem{cfg.max_memory_frames}-s{cfg.memory_stride}-g{cfg.n_gist}"
     )
+    if cfg.use_memory:
+        exp_id += f"+mem{cfg.max_memory_frames}-s{cfg.memory_stride}-g{cfg.n_gist}"
     if cfg.run_id_note is not None:
         exp_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
         exp_id += "--image_aug"
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
-    if distributed_state.is_main_process:  # memory settings, needed to rebuild the base when merging/evaluating
-        (run_dir / "replayvla_config.json").write_text(json.dumps({"vla_path": cfg.vla_path, **cfg.memory_kwargs()}, indent=2))
+    if distributed_state.is_main_process:  # model settings, needed to rebuild the base when merging/evaluating
+        run_config = {"vla_path": cfg.vla_path, "use_memory": cfg.use_memory, **(cfg.memory_kwargs() if cfg.use_memory else {})}
+        (run_dir / "replayvla_config.json").write_text(json.dumps(run_config, indent=2))
 
     # Register OpenVLA + ReplayVLA with HF Auto classes (processor loading; no remote code needed)
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -151,13 +159,17 @@ def train(cfg: ReplayTrainConfig) -> None:
     register_replayvla()
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = load_replayvla(cfg.vla_path, memory_kwargs=cfg.memory_kwargs(), torch_dtype=torch.bfloat16)
-    upcast_memory_modules(vla)
+    if cfg.use_memory:
+        vla = load_replayvla(cfg.vla_path, memory_kwargs=cfg.memory_kwargs(), torch_dtype=torch.bfloat16)
+        upcast_memory_modules(vla)
+    else:
+        vla = load_openvla(cfg.vla_path, torch_dtype=torch.bfloat16)
     if cfg.gradient_checkpointing:
         vla.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    # HF's gradient_checkpointing_enable also flips any submodule with a `gradient_checkpointing` attribute (incl. the
-    # gist encoder), so set the gist encoder's flag explicitly afterwards, and before PEFT copies the module
-    vla.gist_encoder.gradient_checkpointing = cfg.gist_gradient_checkpointing
+    if cfg.use_memory:
+        # HF's gradient_checkpointing_enable also flips any submodule with a `gradient_checkpointing` attribute (incl.
+        # the gist encoder), so set the gist encoder's flag explicitly afterwards, and before PEFT copies the module
+        vla.gist_encoder.gradient_checkpointing = cfg.gist_gradient_checkpointing
     vla = vla.to(device_id)
 
     # Resume (LoRA + memory modules + optimizer + step) if a complete checkpoint exists, else start fresh
@@ -190,29 +202,38 @@ def train(cfg: ReplayTrainConfig) -> None:
     dist.barrier()
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    batch_transform = ReplayRLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder,
-        n_short=cfg.n_short,
-        max_memory=cfg.max_memory_frames,
-    )
-    vla_dataset = ReplayRLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
+    data_kwargs = dict(
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        memory_stride=cfg.memory_stride,
-        n_short=cfg.n_short,
-        max_memory=cfg.max_memory_frames,
     )
+    if cfg.use_memory:
+        batch_transform = ReplayRLDSBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            n_short=cfg.n_short,
+            max_memory=cfg.max_memory_frames,
+        )
+        vla_dataset = ReplayRLDSDataset(
+            cfg.data_root_dir, cfg.dataset_name, batch_transform, **data_kwargs,
+            memory_stride=cfg.memory_stride, n_short=cfg.n_short, max_memory=cfg.max_memory_frames,
+        )
+        collator_cls = ReplayCollator
+    else:
+        batch_transform = RLDSBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+        )
+        vla_dataset = RLDSDataset(cfg.data_root_dir, cfg.dataset_name, batch_transform, **data_kwargs)
+        collator_cls = PaddedCollatorForActionPrediction
     if distributed_state.is_main_process:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    collator = ReplayCollator(processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right")
+    collator = collator_cls(processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right")
     dataloader = DataLoader(vla_dataset, batch_size=cfg.batch_size, sampler=None, collate_fn=collator, num_workers=0)
 
     if distributed_state.is_main_process:
@@ -235,6 +256,8 @@ def train(cfg: ReplayTrainConfig) -> None:
     window = {"loss": 0.0, "action_accuracy": 0.0, "l1_loss": 0.0, "memory_frames": 0.0, "n": 0}
     last_checkpoint_time = last_log_time = time.time()
     last_log_step = completed_steps
+    # OpenVLA's output has no `num_visual_tokens`: its visual prefix is the image's patch count (256)
+    baseline_visual_tokens = vla.module.vision_backbone.featurizer.patch_embed.num_patches
 
     # Note: the RLDS stream is not resumed position-exactly (it is an infinite shuffled stream); a resumed job just
     # continues with fresh shuffled data, which is equivalent in expectation.
@@ -250,13 +273,15 @@ def train(cfg: ReplayTrainConfig) -> None:
 
             (loss / cfg.grad_accumulation_steps).backward()
 
-            metrics = action_metrics(output.logits, inputs["labels"], output.num_visual_tokens, action_tokenizer)
+            num_visual_tokens = getattr(output, "num_visual_tokens", None) or baseline_visual_tokens
+            metrics = action_metrics(output.logits, inputs["labels"], num_visual_tokens, action_tokenizer)
+            memory_frames = inputs["memory_valid"].sum(1).float().mean().item() if "memory_valid" in inputs else 0.0
             recent["loss"].append(loss.item())
             recent["action_accuracy"].append(metrics["action_accuracy"])
             recent["l1_loss"].append(metrics["l1_loss"])
             for key, value in (("loss", loss.item()), ("action_accuracy", metrics["action_accuracy"]),
                                ("l1_loss", metrics["l1_loss"]),
-                               ("memory_frames", inputs["memory_valid"].sum(1).float().mean().item())):
+                               ("memory_frames", memory_frames)):
                 window[key] += value
             window["n"] += 1
 
@@ -285,7 +310,7 @@ def train(cfg: ReplayTrainConfig) -> None:
 
             if distributed_state.is_main_process and completed_steps % 10 == 0:
                 log = {("train_loss" if k == "loss" else k): sum(v) / len(v) for k, v in recent.items()}
-                log["memory_frames_per_example"] = inputs["memory_valid"].sum(1).float().mean().item()
+                log["memory_frames_per_example"] = memory_frames
                 wandb.log(log, step=completed_steps)
 
             # All ranks agree on: stop requested (SIGTERM / SIGUSR1 / stop file)?  periodic checkpoint due?
@@ -316,14 +341,17 @@ def save_merged(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, step, di
     dist.barrier()
 
     if cfg.merge_on_save and distributed_state.is_main_process:
-        merged = merge_lora(cfg.vla_path, adapter_dir, memory_kwargs=cfg.memory_kwargs(), torch_dtype=torch.bfloat16)
+        merged = merge_lora(
+            cfg.vla_path, adapter_dir, memory_kwargs=cfg.memory_kwargs() if cfg.use_memory else None,
+            use_memory=cfg.use_memory, torch_dtype=torch.bfloat16,
+        )
         out_dir = run_dir if cfg.save_latest_checkpoint_only else Path(f"{run_dir}--{step}_chkpt")
         os.makedirs(out_dir, exist_ok=True)
         if not cfg.save_latest_checkpoint_only:
             save_dataset_statistics(vla_dataset.dataset_statistics, out_dir)
             processor.save_pretrained(out_dir)
         merged.save_pretrained(out_dir)
-        print(f"Saved merged ReplayVLA for step {step} at: {out_dir}")
+        print(f"Saved merged {'ReplayVLA' if cfg.use_memory else 'OpenVLA baseline'} for step {step} at: {out_dir}")
         del merged
     dist.barrier()
 

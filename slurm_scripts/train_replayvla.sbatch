@@ -9,18 +9,23 @@
 #SBATCH --requeue                       # preemption = cancel + requeue: the requeued job resumes from the checkpoint
 #SBATCH --signal=B:USR1@900             # 15 min before the time limit, SIGUSR1 to this script -> checkpoint + exit
 #SBATCH --open-mode=append
-#SBATCH --output=/work/sc1081/logs/%x-%j.out
+#SBATCH --output=/work/%u/logs/%x-%j.out
 #
 # Long ReplayVLA training on 2x H200 that survives the 24 h limit and preemption:
 #   - time limit: SIGUSR1 (15 min early) -> STOP file -> all ranks checkpoint at the next step and exit;
 #                 then, if AUTO_RESUBMIT=1 and training isn't DONE, this script resubmits itself (one job at a time)
 #   - preemption: SIGTERM -> STOP file + workers' own SIGTERM handler -> checkpoint (~30 s window); Slurm requeues
 #   - always:     a resumable checkpoint every CHECKPOINT_MIN minutes (safety net if a kill gives no warning)
-# Submit:   sbatch slurm_scripts/train_replayvla.sbatch      (extra train args: sbatch ... -- --lora_rank 16 ...)
-# Env:      AUTO_RESUBMIT=1 to chain jobs until max_steps; MAX_RESUBMITS (default 10); RUN_NOTE for the run name
+# Submit from the repo root (paths resolve from the submit directory):
+#   ReplayVLA:          AUTO_RESUBMIT=1 sbatch slurm_scripts/train_replayvla.sbatch
+#   OpenVLA baseline:   AUTO_RESUBMIT=1 RUN_NOTE=baseline sbatch slurm_scripts/train_replayvla.sbatch --use_memory False
+#   extra train args go after the script name, e.g.  ... train_replayvla.sbatch --max_steps 30000
+# Env:      AUTO_RESUBMIT=1 to chain jobs until max_steps; MAX_RESUBMITS (default 10); RUN_NOTE names the run
+#           (default "main"; use a distinct note per run, e.g. "baseline")
+# Needs:    /work/$USER/logs to exist before submitting (slurm_scripts/setup_env.sh creates it)
 
 set -uo pipefail
-source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
+source "${SLURM_SUBMIT_DIR:-$PWD}/slurm_scripts/common.sh"
 export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
 export TF_CPP_MIN_LOG_LEVEL=3   # hide TF C++ startup noise ("Unable to register cuDNN factory", ...)
 # TF's graph optimizer also prints harmless "op_level_cost_estimator ... Error in PredictCost()" warnings via a logger
@@ -78,7 +83,7 @@ while kill -0 "$TRAIN_PID" 2>/dev/null; do wait "$TRAIN_PID"; done
 wait "$TRAIN_PID"; STATUS=$?
 echo "[$(date)] training exited with status $STATUS"
 
-RUN_DIR=$(ls -d "$RUN_ROOT"/replayvla+*--"$RUN_NOTE"* 2>/dev/null | head -1)
+RUN_DIR=$(ls -d "$RUN_ROOT"/*--"$RUN_NOTE" "$RUN_ROOT"/*--"$RUN_NOTE"--* 2>/dev/null | head -1)   # use a distinct RUN_NOTE per run
 if [[ -n "$RUN_DIR" && -f "$RUN_DIR/DONE" ]]; then
     echo "Training finished: $(cat "$RUN_DIR/DONE")"
 elif [[ "$TIME_LIMIT_HIT" == 1 && "${AUTO_RESUBMIT:-0}" == 1 && "$RESUBMIT_COUNT" -lt "$MAX_RESUBMITS" ]]; then

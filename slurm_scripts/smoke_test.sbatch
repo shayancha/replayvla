@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=01:30:00
-#SBATCH --output=/work/sc1081/logs/%x-%j.out
+#SBATCH --output=/work/%u/logs/%x-%j.out
 #
 # 1x H200 smoke test of the full pipeline on real data (openvla-7b + LIBERO-10):
 #   phase 1: 30 steps from scratch (LLM grad checkpointing), resumable checkpoint at the end   -> step time, GPU memory
@@ -15,7 +15,7 @@
 # Usage: sbatch slurm_scripts/smoke_test.sbatch [BATCH_SIZE (default 8)]
 
 set -uo pipefail
-source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
+source "${SLURM_SUBMIT_DIR:-$PWD}/slurm_scripts/common.sh"
 export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
 
 BS=${1:-8}

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Shared environment for ReplayVLA on the Duke Compute Cluster (sourced by setup + sbatch scripts).
 # sbatch jobs do not inherit ~/.bashrc, so caches are redirected here too (home quota is 25 GB).
-# Same conventions as /work/sc1081/ReWAM. NOTE: /work purges files older than 75 days -- keep code on GitHub and
+# NOTE: /work purges files older than 75 days -- keep code on GitHub and
 # copy checkpoints worth keeping elsewhere.
 
-export WORK_DIR="${WORK_DIR:-/work/sc1081}"
+export WORK_DIR="${WORK_DIR:-/work/$USER}"
 export REPO_DIR="${REPO_DIR:-$WORK_DIR/replayvla}"
 export HF_HOME="${HF_HOME:-$WORK_DIR/.cache/huggingface}"           # openvla/openvla-7b weights
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$WORK_DIR/.cache/pip}"

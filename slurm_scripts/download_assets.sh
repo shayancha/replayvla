@@ -1,5 +1,5 @@
 #!/bin/bash
-# Download what training needs into /work/sc1081 (run on a compute node; needs internet, which DCC compute nodes have):
+# Download what training needs into /work/$USER (run on a compute node; needs internet, which DCC compute nodes have):
 #   - openvla/openvla-7b                       -> $HF_HOME (Hugging Face cache, ~15 GB)
 #   - openvla/modified_libero_rlds: libero_10_no_noops only (LIBERO-Long)   -> $DATA_ROOT
 set -euo pipefail

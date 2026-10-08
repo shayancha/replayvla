@@ -5,6 +5,7 @@ Helpers for training ReplayVLA, kept here (not in the script) so they can be uni
 
     load_replayvla           load an OpenVLA checkpoint as ReplayVLA (new memory modules initialized), or a ReplayVLA
                              checkpoint as-is
+    load_openvla             load plain OpenVLA (the no-memory baseline, trained with the same script/recipe)
     wrap_with_lora           LoRA on every pretrained linear layer (like finetune.py's "all-linear"), memory modules
                              trained in full via `modules_to_save`
     merge_lora               rebuild the base, apply a saved adapter, merge -> plain ReplayVLA for eval
@@ -20,6 +21,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import PretrainedConfig
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 
 from .configuration import ReplayVLAConfig
 from .modeling import ReplayVLAForActionPrediction
@@ -62,6 +64,15 @@ def load_replayvla(
     )
 
 
+def load_openvla(
+    path: Union[str, Path], torch_dtype: torch.dtype = torch.bfloat16, low_cpu_mem_usage: bool = True, **kwargs
+) -> OpenVLAForActionPrediction:
+    """Plain OpenVLA (no memory), for the baseline."""
+    return OpenVLAForActionPrediction.from_pretrained(
+        str(path), torch_dtype=torch_dtype, low_cpu_mem_usage=low_cpu_mem_usage, **kwargs
+    )
+
+
 def upcast_memory_modules(model: ReplayVLAForActionPrediction) -> None:
     """Keep the fully-trained (randomly initialized) memory modules in fp32; autocast still runs them in bf16."""
     for name in MEMORY_MODULES:
@@ -78,23 +89,32 @@ def lora_target_modules(model: nn.Module) -> List[str]:
     ]
 
 
-def wrap_with_lora(model: ReplayVLAForActionPrediction, rank: int = 32, dropout: float = 0.0) -> PeftModel:
+def wrap_with_lora(model: nn.Module, rank: int = 32, dropout: float = 0.0) -> PeftModel:
+    """LoRA on all pretrained linears; for ReplayVLA, the memory modules are trained in full (modules_to_save)."""
+    has_memory = isinstance(model, ReplayVLAForActionPrediction)
     lora_config = LoraConfig(
         r=rank,
         lora_alpha=min(rank, 16),
         lora_dropout=dropout,
         target_modules=lora_target_modules(model),
         init_lora_weights="gaussian",
-        modules_to_save=list(MEMORY_MODULES),
+        modules_to_save=list(MEMORY_MODULES) if has_memory else None,
     )
     return get_peft_model(model, lora_config)
 
 
 def merge_lora(
-    base_path: Union[str, Path], adapter_dir: Union[str, Path], memory_kwargs: Optional[Dict] = None, **load_kwargs
-) -> ReplayVLAForActionPrediction:
-    """Base (OpenVLA or ReplayVLA checkpoint) + saved adapter -> merged ReplayVLA with trained memory modules."""
-    base = load_replayvla(base_path, memory_kwargs=memory_kwargs, **load_kwargs)
+    base_path: Union[str, Path],
+    adapter_dir: Union[str, Path],
+    memory_kwargs: Optional[Dict] = None,
+    use_memory: bool = True,
+    **load_kwargs,
+) -> nn.Module:
+    """Base + saved adapter -> merged model: ReplayVLA with trained memory modules, or (use_memory=False) OpenVLA."""
+    if use_memory:
+        base = load_replayvla(base_path, memory_kwargs=memory_kwargs, **load_kwargs)
+    else:
+        base = load_openvla(base_path, **load_kwargs)
     return PeftModel.from_pretrained(base, str(adapter_dir)).merge_and_unload()
 
 
@@ -110,8 +130,11 @@ def action_metrics(logits: torch.Tensor, labels: torch.Tensor, num_visual_tokens
 
 
 def batch_to_model_inputs(batch: Dict, device: Union[int, torch.device], dtype: torch.dtype = torch.bfloat16) -> Dict:
+    """Moves the model's inputs to `device` (pixels cast to `dtype`); memory keys are skipped when absent (baseline)."""
     inputs = {}
     for key in MODEL_INPUT_KEYS:
+        if key not in batch:
+            continue
         value = batch[key].to(device)
         inputs[key] = value.to(dtype) if key in PIXEL_KEYS else value
     return inputs

@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-time: install the LIBERO simulator (for eval) into the replayvla env, as in OpenVLA's README.
-#   LIBERO repo -> /work/sc1081/LIBERO ; config -> $LIBERO_CONFIG_PATH (pre-written so the first import never prompts)
+#   LIBERO repo -> /work/$USER/LIBERO ; config -> $LIBERO_CONFIG_PATH (pre-written so the first import never prompts)
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 export TMPDIR=/tmp   # node-local: pip wheel builds in /work (NFS) fail with .nfs* "Directory not empty"
