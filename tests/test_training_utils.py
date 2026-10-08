@@ -197,8 +197,8 @@ def test_resume_checkpoint_round_trip():
             step(vla, opt)
         save_resume_checkpoint(vla, opt, {"completed_steps": 2, "wandb_run_id": "abc"}, run_dir)
 
-        # A job killed mid-save leaves a partial resume.tmp; it must be ignored
-        (run_dir / "resume.tmp").mkdir()
+        # A job killed mid-save leaves a partial resume.tmp.<id>; it must be ignored
+        (run_dir / "resume.tmp.dead").mkdir()
         assert find_resume_checkpoint(run_dir) == run_dir / "resume"
 
         resumed, opt_state, state = load_resume_checkpoint(fresh_base(), find_resume_checkpoint(run_dir))
@@ -218,8 +218,9 @@ def test_resume_checkpoint_round_trip():
 
         # Second save swaps atomically; a kill between the two renames leaves only resume.old, which is still found
         save_resume_checkpoint(vla, opt, {"completed_steps": 3}, run_dir)
-        (run_dir / "resume").rename(run_dir / "resume.old")
-        assert find_resume_checkpoint(run_dir) == run_dir / "resume.old"
+        assert not list(run_dir.glob("resume.tmp.*")) and not list(run_dir.glob("resume.old.*")), "stale dirs left"
+        (run_dir / "resume").rename(run_dir / "resume.old.x")
+        assert find_resume_checkpoint(run_dir) == run_dir / "resume.old.x"
 
 
 def test_stop_request_signals_and_file():

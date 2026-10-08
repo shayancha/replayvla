@@ -20,7 +20,8 @@
 # Env:      AUTO_RESUBMIT=1 to chain jobs until max_steps; MAX_RESUBMITS (default 10); RUN_NOTE for the run name
 
 set -uo pipefail
-source "$(dirname "$0")/common.sh" 2>/dev/null || source /work/sc1081/replayvla/slurm_scripts/common.sh
+source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
+export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
 
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-2}
 CHECKPOINT_MIN=${CHECKPOINT_MIN:-30}
@@ -28,8 +29,13 @@ RESUBMIT_COUNT=${RESUBMIT_COUNT:-0}
 MAX_RESUBMITS=${MAX_RESUBMITS:-10}
 RUN_NOTE=${RUN_NOTE:-main}
 STOP_FILE=$RUN_ROOT/STOP-${RUN_NOTE}
+# Log to wandb online only if this account is logged in on DCC (run `wandb login` once); otherwise offline (sync later)
+if [[ -z "${WANDB_MODE:-}" ]]; then
+  if grep -q api.wandb.ai ~/.netrc 2>/dev/null; then WANDB_MODE=online; else WANDB_MODE=offline; fi
+fi
 TIME_LIMIT_HIT=0
 
+echo "[$(date)] wandb mode: $WANDB_MODE"
 echo "[$(date)] job $SLURM_JOB_ID (restart count ${SLURM_RESTART_COUNT:-0}, resubmit $RESUBMIT_COUNT) on $(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
@@ -48,6 +54,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NUM_GPUS" vla-scripts/train_
     --run_id_note "$RUN_NOTE" \
     --stop_file "$STOP_FILE" \
     --checkpoint_interval_minutes "$CHECKPOINT_MIN" \
+    --wandb_mode "$WANDB_MODE" \
     "$@" &
 TRAIN_PID=$!
 

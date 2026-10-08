@@ -15,7 +15,8 @@
 # Usage: sbatch slurm_scripts/smoke_test.sbatch [BATCH_SIZE (default 8)]
 
 set -uo pipefail
-source /work/sc1081/replayvla/slurm_scripts/common.sh
+source "${SLURM_SUBMIT_DIR:-/work/sc1081/replayvla}/slurm_scripts/common.sh"
+export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
 
 BS=${1:-8}
 NOTE=smoke-bs$BS

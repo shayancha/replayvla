@@ -118,38 +118,47 @@ def batch_to_model_inputs(batch: Dict, device: Union[int, torch.device], dtype: 
 
 
 # === Resumable checkpoints (preemption / time-limit safe) ===
-# Layout: <run_dir>/resume/{adapter/, optimizer.pt, trainer_state.json}. Written to resume.tmp and swapped in with
-# renames, so a job killed mid-save always leaves the previous complete checkpoint behind.
-RESUME_DIR, RESUME_TMP, RESUME_OLD = "resume", "resume.tmp", "resume.old"
+# Layout: <run_dir>/resume/{adapter/, optimizer.pt, trainer_state.json, COMPLETE}. Each save writes a uniquely named
+# resume.tmp.<id> and swaps it in by renames, so a job killed mid-save always leaves a complete checkpoint behind.
+# Old/partial directories are removed best-effort: on DCC /work (NFS), deleting files that are still open leaves
+# .nfs* placeholders and rmtree fails with "Directory not empty", which must never crash a training job.
+RESUME_DIR = "resume"
+
+
+def _best_effort_rmtree(path: Path) -> None:
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def save_resume_checkpoint(peft_model, optimizer, trainer_state: Dict, run_dir: Union[str, Path]) -> Path:
     import json
-    import shutil
+    import uuid
 
     run_dir = Path(run_dir)
-    tmp, final, old = run_dir / RESUME_TMP, run_dir / RESUME_DIR, run_dir / RESUME_OLD
-    shutil.rmtree(tmp, ignore_errors=True)
+    tag = uuid.uuid4().hex[:8]
+    tmp, final, old = run_dir / f"resume.tmp.{tag}", run_dir / RESUME_DIR, run_dir / f"resume.old.{tag}"
     tmp.mkdir(parents=True)
     peft_model.save_pretrained(tmp / "adapter")                  # LoRA weights + memory modules (modules_to_save)
     torch.save(optimizer.state_dict(), tmp / "optimizer.pt")
     (tmp / "trainer_state.json").write_text(json.dumps(trainer_state))
     (tmp / "COMPLETE").touch()                                   # only complete checkpoints are ever resumed from
-    shutil.rmtree(old, ignore_errors=True)
     if final.exists():
         final.rename(old)
     tmp.rename(final)
-    shutil.rmtree(old, ignore_errors=True)
+    for stale in list(run_dir.glob("resume.old.*")) + [p for p in run_dir.glob("resume.tmp.*") if p != tmp]:
+        _best_effort_rmtree(stale)
     return final
 
 
 def find_resume_checkpoint(run_dir: Union[str, Path]) -> Optional[Path]:
-    """Newest complete checkpoint, also covering a kill between the two renames (then only resume.old exists)."""
-    for name in (RESUME_DIR, RESUME_OLD):
-        path = Path(run_dir) / name
-        if (path / "COMPLETE").exists():
-            return path
-    return None
+    """The complete checkpoint to resume from: `resume/`, or, if a kill landed between the two renames, the newest
+    complete `resume.old.*`. Partial `resume.tmp.*` directories are never used."""
+    run_dir = Path(run_dir)
+    if (run_dir / RESUME_DIR / "COMPLETE").exists():
+        return run_dir / RESUME_DIR
+    olds = [p for p in run_dir.glob("resume.old.*") if (p / "COMPLETE").exists()]
+    return max(olds, key=lambda p: (p / "COMPLETE").stat().st_mtime) if olds else None
 
 
 def load_resume_checkpoint(base_model: ReplayVLAForActionPrediction, checkpoint: Union[str, Path]):
