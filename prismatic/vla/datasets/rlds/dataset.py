@@ -266,6 +266,7 @@ def apply_trajectory_transforms(
     task_augment_strategy: Optional[str] = None,
     task_augment_kwargs: dict = {},
     num_parallel_calls: int = tf.data.AUTOTUNE,
+    chunk_fn: Optional[Callable[[dict], dict]] = None,
 ) -> dl.DLataset:
     """
     Applies common transforms that happen at a trajectory level. Such transforms are usually some sort of "relabeling"
@@ -297,6 +298,9 @@ def apply_trajectory_transforms(
         task_augment_kwargs (dict, optional): Additional keyword arguments to pass to the task augmentation
             function.
         num_parallel_calls (int, optional): number of parallel calls for map operations. Default to AUTOTUNE.
+        chunk_fn (callable, optional): replaces the default `chunk_act_obs` chunking (e.g. ReplayVLA's memory frame
+            gather, `memory_bank.rlds_transforms.replay_chunk_obs`). If set, `window_size` and
+            `future_action_window_size` are ignored.
     """
     if skip_unlabeled:
         if "language_instruction" not in dataset.element_spec["task"]:
@@ -333,14 +337,13 @@ def apply_trajectory_transforms(
 
     # chunks observations and actions, giving them a new axis at index 1 of size `window_size` and
     # `window_size + future_action_window_size`, respectively
-    dataset = dataset.traj_map(
-        partial(
+    if chunk_fn is None:
+        chunk_fn = partial(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
-        ),
-        num_parallel_calls,
-    )
+        )
+    dataset = dataset.traj_map(chunk_fn, num_parallel_calls)
 
     if train and subsample_length is not None:
         dataset = dataset.traj_map(

@@ -1,5 +1,6 @@
 """Utils for evaluating the OpenVLA policy."""
 
+import importlib.util
 import json
 import os
 import time
@@ -40,9 +41,11 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
+    # Flash-Attention 2 if installed, else PyTorch SDPA (same attention ReplayVLA evals use)
+    attn_implementation = "flash_attention_2" if importlib.util.find_spec("flash_attn") is not None else "sdpa"
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
