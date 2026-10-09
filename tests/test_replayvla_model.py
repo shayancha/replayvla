@@ -37,16 +37,17 @@ def tiny(cfg):
     return cfg
 
 
-def replay_config():
+def replay_config(n_anchor=1):
     return tiny(ReplayVLAConfig(
         vision_backbone_id="dinosiglip-vit-so-224px", llm_backbone_id="llama2-7b-pure", text_config=TEXT,
         norm_stats=NORM_STATS, n_short=S + 1, max_memory_frames=M, n_gist=G, gist_dim=32, gist_depth=1, gist_heads=4,
+        n_anchor=n_anchor,
     ))
 
 
-def make_model():
+def make_model(n_anchor=1):
     torch.manual_seed(0)
-    return ReplayVLAForActionPrediction(replay_config()).eval()
+    return ReplayVLAForActionPrediction(replay_config(n_anchor)).eval()
 
 
 def make_inputs(seed=1):
@@ -153,6 +154,45 @@ def test_memory_features_path_matches_pixels():
     inp2 = {k: v for k, v in inp.items() if k != "memory_pixel_values"}
     out = run(model, **inp2, memory_features=feats).logits
     assert torch.allclose(base, out, atol=1e-5), "precomputed memory_features must give the same result as pixels"
+
+
+def test_memory_gists_path_matches_pixels():
+    """Eval passes gists computed incrementally (GistEncoder.add_frame); the LLM must see the same tokens."""
+    model = make_model()
+    inp = make_inputs()
+    base = run(model, **inp).logits
+    anchor = model._featurize(inp["anchor_pixel_values"])
+    feats = model.encode_memory_frames(inp["memory_pixel_values"], inp["memory_valid"])
+    gists = torch.zeros(B, M, G, model.gist_encoder.d)
+    for b in range(B):
+        cache = model.gist_encoder.init_cache(anchor[b : b + 1])
+        for i in range(int(inp["memory_valid"][b].sum())):
+            gists[b, i] = model.gist_encoder.add_frame(cache, feats[b : b + 1, i], inp["memory_timesteps"][b : b + 1, i])[0]
+    inp2 = {k: v for k, v in inp.items() if k != "memory_pixel_values"}
+    out = run(model, **inp2, memory_gists=gists).logits
+    assert torch.allclose(base, out, atol=1e-4), f"cached gists differ from the full pass, max {(base - out).abs().max():.2e}"
+
+
+def two_anchor_inputs(seed=1):
+    inp = make_inputs(seed)
+    g = torch.Generator().manual_seed(seed + 10)
+    inp["anchor_pixel_values"] = torch.stack([inp["anchor_pixel_values"], torch.randn(B, 6, 224, 224, generator=g)], 1)
+    inp["anchor_valid"] = torch.tensor([[True, False], [True, True]])   # example 0: frame 8 not in the past yet
+    return inp
+
+
+def test_two_anchors_shapes_and_empty_anchor_invisible():
+    model = make_model(n_anchor=2)
+    assert model.role_emb.weight.shape[0] == 2 + S + 1
+    inp = two_anchor_inputs()
+    out = run(model, **inp)
+    assert out.num_visual_tokens == N_VISUAL + P, f"expected one more frame of tokens, got {out.num_visual_tokens}"
+    inp2 = dict(inp, anchor_pixel_values=inp["anchor_pixel_values"].clone())
+    inp2["anchor_pixel_values"][:, 1] += noise_like(inp2["anchor_pixel_values"][:, 1], 7)
+    out2 = run(model, **inp2)
+    text = slice(out.num_visual_tokens, None)
+    assert torch.allclose(out.logits[0, text], out2.logits[0, text], atol=1e-5), "an empty anchor must be invisible"
+    assert not torch.allclose(out.logits[1, text], out2.logits[1, text], atol=1e-5), "a real second anchor must be used"
 
 
 def test_generate_uses_memory_and_matches_forward():

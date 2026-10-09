@@ -95,6 +95,7 @@ class ReplayTrainConfig:
     memory_stride: int = 8
     n_short: int = 4
     max_memory_frames: int = 64
+    n_anchor: int = 2                                               # anchor frames 0, s, … in full (MemoryWAM: 2)
     n_gist: int = 8
     gist_dim: int = 1024
     gist_depth: int = 4
@@ -138,7 +139,7 @@ class ReplayTrainConfig:
         return dict(
             memory_stride=self.memory_stride, n_short=self.n_short, max_memory_frames=self.max_memory_frames,
             n_gist=self.n_gist, gist_dim=self.gist_dim, gist_depth=self.gist_depth, gist_heads=self.gist_heads,
-            gist_n_recent=self.gist_n_recent, gist_max_timestep=self.gist_max_timestep,
+            gist_n_recent=self.gist_n_recent, gist_max_timestep=self.gist_max_timestep, n_anchor=self.n_anchor,
         )
 
 
@@ -159,6 +160,8 @@ def train(cfg: ReplayTrainConfig) -> None:
     )
     if cfg.use_memory:
         exp_id += f"+mem{cfg.max_memory_frames}-s{cfg.memory_stride}-g{cfg.n_gist}"
+        if cfg.n_anchor != 1:   # runs from before n_anchor existed (1 anchor) keep their names, so they still resume
+            exp_id += f"-a{cfg.n_anchor}"
     if cfg.run_id_note is not None:
         exp_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
@@ -232,10 +235,12 @@ def train(cfg: ReplayTrainConfig) -> None:
             prompt_builder_fn=PurePromptBuilder,
             n_short=cfg.n_short,
             max_memory=cfg.max_memory_frames,
+            n_anchor=cfg.n_anchor,
         )
         vla_dataset = ReplayRLDSDataset(
             cfg.data_root_dir, cfg.dataset_name, batch_transform, **data_kwargs,
             memory_stride=cfg.memory_stride, n_short=cfg.n_short, max_memory=cfg.max_memory_frames,
+            n_anchor=cfg.n_anchor,
         )
         collator_cls = ReplayCollator
     else:

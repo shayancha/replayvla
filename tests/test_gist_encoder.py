@@ -188,6 +188,67 @@ def test_gradients_reach_every_parameter():
     assert not dead, f"these parameters got no gradient (unused in forward?): {dead}"
 
 
+
+def incremental_gists(enc, patches, timesteps, anchor):
+    """Gists computed one frame at a time against the key/value cache (the eval path)."""
+    cache = enc.init_cache(anchor)
+    return torch.stack([enc.add_frame(cache, patches[:, i], timesteps[:, i]) for i in range(patches.shape[1])], 1), cache
+
+
+def test_incremental_cache_matches_parallel():
+    for overrides in (dict(), dict(n_recent=0), dict(n_recent=1), dict(depth=3)):
+        enc = make_encoder(**overrides)
+        p, v, t, a = make_inputs()
+        full = run(enc, p[1:], v[1:], t[1:], a[1:])                    # example 1: all frames real
+        inc, _ = incremental_gists(enc, p[1:], t[1:], a[1:])
+        assert torch.allclose(inc, full, atol=ATOL), f"{overrides}: incremental gists differ, max {(inc - full).abs().max():.2e}"
+        # Example 0's 5 real frames, fed incrementally, match the padded parallel pass too
+        inc0, _ = incremental_gists(enc, p[:1, :5], t[:1, :5], a[:1])
+        assert torch.allclose(inc0, run(enc, p, v, t, a)[:1, :5], atol=ATOL), f"{overrides}: differs with padding"
+
+
+def test_cache_evicts_old_patches_and_keeps_every_gist():
+    enc = make_encoder()
+    p, _, t, a = make_inputs()
+    _, cache = incremental_gists(enc, p, t, a)
+    for layer in range(DEPTH):
+        assert len(cache.recent_patches[layer]) == N_RECENT, "only the newest n_recent frames' patches stay cached"
+        assert all(k.shape[2] == P for k, _ in cache.recent_patches[layer])
+        assert cache.gists[layer][0].shape[2] == M * G, "every past frame's gists stay cached"
+    assert cache.n_frames == M
+
+
+def test_add_frame_does_not_change_past_gists():
+    enc = make_encoder()
+    p, _, t, a = make_inputs()
+    cache = enc.init_cache(a)
+    first = [enc.add_frame(cache, p[:, i], t[:, i]) for i in range(3)]
+    before = [g.clone() for g in cache.gists[0]]
+    enc.add_frame(cache, p[:, 3], t[:, 3])
+    assert all(torch.equal(b, g[:, :, : 3 * G]) for b, g in zip(before, cache.gists[0])), "cached past gists must not change"
+    assert torch.allclose(torch.stack(first, 1), run(enc, p[:, :3], torch.ones(B, 3, dtype=torch.bool), t[:, :3], a), atol=ATOL)
+
+
+
+def test_two_anchors_incremental_matches_parallel_and_empty_anchor_is_invisible():
+    enc = make_encoder()
+    p, v, t, a = make_inputs()
+    anchors = torch.stack([a, a.flip(1) + 1.0], 1)                       # [B, 2, P, VD]: frames 0 and 8
+    a_t = torch.tensor([[0, 8]] * B)
+    both = torch.ones(B, 2, dtype=torch.bool)
+    with torch.no_grad():
+        full = enc(p[1:], v[1:], t[1:], anchors[1:], both[1:], a_t[1:])
+    cache = enc.init_cache(anchors[1:], a_t[1:])
+    inc = torch.stack([enc.add_frame(cache, p[1:, i], t[1:, i]) for i in range(M)], 1)
+    assert torch.allclose(inc, full, atol=ATOL), f"2 anchors: incremental differs, max {(inc - full).abs().max():.2e}"
+    assert not torch.allclose(full, run(enc, p[1:], v[1:], t[1:], a[1:]), atol=ATOL), "the second anchor must be used"
+    # An empty second anchor (not yet in the past) changes nothing vs a single anchor
+    half = torch.tensor([[True, False]] * B)
+    with torch.no_grad():
+        masked = enc(p, v, t, anchors + noise_like(anchors, 3) * torch.tensor([0.0, 1.0])[None, :, None, None], half, a_t)
+    assert torch.allclose(masked, run(enc, p, v, t, a), atol=ATOL), "an empty anchor must be invisible"
+
+
 TESTS = [
     test_shapes,
     test_empty_frames_output_zeros,
@@ -199,6 +260,10 @@ TESTS = [
     test_timesteps_are_used,
     test_batch_independence,
     test_gradients_reach_every_parameter,
+    test_incremental_cache_matches_parallel,
+    test_cache_evicts_old_patches_and_keeps_every_gist,
+    test_add_frame_does_not_change_past_gists,
+    test_two_anchors_incremental_matches_parallel_and_empty_anchor_is_invisible,
 ]
 
 if __name__ == "__main__":

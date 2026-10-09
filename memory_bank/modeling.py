@@ -6,12 +6,12 @@ without modifying it; with no memory inputs it behaves exactly like OpenVLA.
 
 LLM input sequence (all visual tokens are spliced in after <BOS>, as OpenVLA does with its single image):
 
-    [BOS] [anchor ×P] [gists ×M·G] [short ×(n_short-1)·P] [current ×P] [prompt …] [action tokens …]
+    [BOS] [anchors ×A·P] [gists ×M·G] [short ×(n_short-1)·P] [current ×P] [prompt …] [action tokens …]
 
-  - anchor / short / current frames: vision backbone → OpenVLA's existing projector (full resolution)
+  - anchor frames (0, s, … ; A = n_anchor) / short / current frames: vision backbone → OpenVLA's existing projector
   - memory frames: vision backbone (no grad) → GistEncoder → gist projector
-  - learned role embeddings (zero-init) are added to anchor, each short-term age slot, and gists, so at init the
-    current-frame pathway is unchanged; empty short-term / memory slots get attention-mask 0
+  - learned role embeddings (zero-init) are added to each anchor, each short-term age slot, and gists, so at init the
+    current-frame pathway is unchanged; empty anchor / short-term / memory slots get attention-mask 0
   - every visual position gets label IGNORE_INDEX (trained only through the action loss)
 """
 
@@ -33,12 +33,14 @@ from .gist_encoder import GistEncoder
 # Extra forward() kwargs carrying memory; passed through generate() on the first (uncached) step only
 MEMORY_KWARGS = (
     "anchor_pixel_values",
+    "anchor_valid",
     "short_pixel_values",
     "short_valid",
     "memory_pixel_values",
     "memory_valid",
     "memory_timesteps",
     "memory_features",
+    "memory_gists",
 )
 
 
@@ -61,7 +63,7 @@ class GistProjector(nn.Module):
 
 
 class RoleEmbeddings(nn.Module):
-    """Learned role vectors [anchor, short slot 0 … short slot n-1, gist], added to visual tokens; zero-init.
+    """Learned role vectors [anchor 0 … anchor A-1, short slot 0 … short slot n-1, gist], added to visual tokens; zero-init.
     A module (not a bare Parameter) so PEFT's `modules_to_save` can train and save it alongside LoRA."""
 
     def __init__(self, n_roles: int, dim: int) -> None:
@@ -76,6 +78,7 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
         super().__init__(config)
         llm_dim = config.text_config.hidden_size
         self.n_short_past = config.n_short - 1
+        self.n_anchor = getattr(config, "n_anchor", 1)
 
         self.gist_encoder = GistEncoder(
             vision_dim=self.vision_backbone.embed_dim,
@@ -88,8 +91,8 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
         )
         self.gist_projector = GistProjector(config.gist_dim, llm_dim)
 
-        # Role embeddings: [anchor, short slot 0 … short slot n_short-2 (oldest → newest age), gist]; zero-init
-        self.role_emb = RoleEmbeddings(1 + self.n_short_past + 1, llm_dim)
+        # Role embeddings: [anchor 0 … A-1, short slot 0 … n_short-2 (oldest → newest age), gist]; zero-init
+        self.role_emb = RoleEmbeddings(self.n_anchor + self.n_short_past + 1, llm_dim)
 
     # === Initialization of new parameters when loading an OpenVLA checkpoint (they show up as "missing keys") ===
     def _init_weights(self, module: nn.Module) -> None:
@@ -149,41 +152,64 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
     def build_visual_tokens(
         self,
         pixel_values: torch.Tensor,           # [B, C, H, W]        current frame
-        anchor_pixel_values: torch.Tensor,    # [B, C, H, W]
+        anchor_pixel_values: torch.Tensor,    # [B, A, C, H, W]     (or [B, C, H, W] when A = 1)
         short_pixel_values: torch.Tensor,     # [B, S, C, H, W]     S = n_short - 1, age-aligned (last = newest)
         short_valid: torch.Tensor,            # [B, S] bool
         memory_valid: torch.Tensor,           # [B, M] bool         oldest first, empty slots at the end
         memory_timesteps: torch.Tensor,       # [B, M] long
         memory_pixel_values: Optional[torch.Tensor] = None,  # [B, M, C, H, W]
-        memory_features: Optional[torch.Tensor] = None,      # [B, M, P, vision_dim] (precomputed, e.g. cached at eval)
+        memory_features: Optional[torch.Tensor] = None,      # [B, M, P, vision_dim] (precomputed ViT features)
+        memory_gists: Optional[torch.Tensor] = None,         # [B, M, G, gist_dim] (gist encoder output, cached at eval)
+        anchor_valid: Optional[torch.Tensor] = None,         # [B, A] bool (default: all real)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (visual tokens [B, V, D], visual attention mask [B, V], current-frame tokens [B, P, D])."""
         B, S = short_valid.shape
         assert S == self.n_short_past, f"expected {self.n_short_past} short-term slots, got {S}"
-        assert (memory_features is None) != (memory_pixel_values is None), "pass exactly one of memory_pixel_values / memory_features"
+        n_memory_inputs = sum(x is not None for x in (memory_pixel_values, memory_features, memory_gists))
+        assert n_memory_inputs == 1, "pass exactly one of memory_pixel_values / memory_features / memory_gists"
+
+        if anchor_pixel_values.dim() == 4:
+            anchor_pixel_values = anchor_pixel_values[:, None]
+        A = anchor_pixel_values.shape[1]
+        assert A == self.n_anchor, f"expected {self.n_anchor} anchor frames, got {A}"
+        if anchor_valid is None:
+            anchor_valid = torch.ones(B, A, dtype=torch.bool, device=anchor_pixel_values.device)
+        anchor_valid = anchor_valid.bool()
+        anchor_timesteps = torch.arange(A, device=anchor_valid.device)[None] * self.config.memory_stride  # [1, A]
+        anchor_timesteps = anchor_timesteps.expand(B, A)
 
         current = self._featurize(pixel_values)                                               # [B, P, Dv]
-        anchor = self._featurize(anchor_pixel_values)                                         # [B, P, Dv]
+        anchor = self._featurize(anchor_pixel_values.flatten(0, 1))
+        anchor = anchor.reshape(B, A, *anchor.shape[1:])                                      # [B, A, P, Dv]
         short = self._featurize(short_pixel_values.reshape(B * S, *short_pixel_values.shape[2:]))
         short = short.reshape(B, S, *short.shape[1:])                                         # [B, S, P, Dv]
-        if memory_features is None:
-            memory_features = self.encode_memory_frames(memory_pixel_values, memory_valid)    # [B, M, P, Dv]
-
-        gists = self.gist_encoder(memory_features.to(anchor.dtype), memory_valid, memory_timesteps, anchor)  # [B, M, G, dg]
+        if memory_gists is not None:   # eval: gists computed incrementally (GistEncoder.add_frame), one per new frame
+            gists = memory_gists.to(anchor.dtype) * memory_valid[:, :, None, None].to(anchor.dtype)
+        else:
+            if memory_features is None:
+                memory_features = self.encode_memory_frames(memory_pixel_values, memory_valid)  # [B, M, P, Dv]
+            gists = self.gist_encoder(
+                memory_features.to(anchor.dtype), memory_valid, memory_timesteps, anchor, anchor_valid, anchor_timesteps
+            )                                                                                 # [B, M, G, dg]
 
         role = self.role_emb.weight
         current_tokens = self.projector(current)                                              # [B, P, D]
-        anchor_tokens = self.projector(anchor) + role[0]                                      # [B, P, D]
-        short_tokens = self.projector(short) + role[1 : 1 + S][None, :, None, :]              # [B, S, P, D]
+        anchor_tokens = self.projector(anchor) + role[:A][None, :, None, :]                   # [B, A, P, D]
+        short_tokens = self.projector(short) + role[A : A + S][None, :, None, :]              # [B, S, P, D]
         gist_tokens = self.gist_projector(gists) + role[-1]                                   # [B, M, G, D]
 
         P, G = current_tokens.shape[1], gists.shape[2]
         visual = torch.cat(
-            [anchor_tokens, gist_tokens.flatten(1, 2), short_tokens.flatten(1, 2), current_tokens], dim=1
+            [anchor_tokens.flatten(1, 2), gist_tokens.flatten(1, 2), short_tokens.flatten(1, 2), current_tokens], dim=1
         )                                                                                     # [B, V, D]
         ones = torch.ones(B, P, dtype=torch.bool, device=visual.device)
         visual_mask = torch.cat(
-            [ones, memory_valid.bool().repeat_interleave(G, dim=1), short_valid.bool().repeat_interleave(P, dim=1), ones],
+            [
+                anchor_valid.repeat_interleave(P, dim=1),
+                memory_valid.bool().repeat_interleave(G, dim=1),
+                short_valid.bool().repeat_interleave(P, dim=1),
+                ones,
+            ],
             dim=1,
         )                                                                                     # [B, V]
         return visual, visual_mask, current_tokens
@@ -203,12 +229,14 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
         output_projector_features: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         anchor_pixel_values: Optional[torch.FloatTensor] = None,
+        anchor_valid: Optional[torch.Tensor] = None,
         short_pixel_values: Optional[torch.FloatTensor] = None,
         short_valid: Optional[torch.Tensor] = None,
         memory_pixel_values: Optional[torch.FloatTensor] = None,
         memory_valid: Optional[torch.Tensor] = None,
         memory_timesteps: Optional[torch.LongTensor] = None,
         memory_features: Optional[torch.FloatTensor] = None,
+        memory_gists: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, ReplayVLACausalLMOutputWithPast]:
         # No memory inputs (vanilla OpenVLA usage), or a cached generation step: defer to OpenVLA unchanged
         if anchor_pixel_values is None or past_key_values is not None:
@@ -236,7 +264,8 @@ class ReplayVLAForActionPrediction(OpenVLAForActionPrediction):
 
         visual, visual_mask, current_tokens = self.build_visual_tokens(
             pixel_values, anchor_pixel_values, short_pixel_values, short_valid, memory_valid, memory_timesteps,
-            memory_pixel_values=memory_pixel_values, memory_features=memory_features,
+            memory_pixel_values=memory_pixel_values, memory_features=memory_features, memory_gists=memory_gists,
+            anchor_valid=anchor_valid,
         )
         B, V = visual_mask.shape
 

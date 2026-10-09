@@ -33,9 +33,12 @@ from prismatic.vla.datasets.rlds.dataset import apply_trajectory_transforms  # n
 STRIDE, N_SHORT = 8, 4
 
 
-def python_window(t, max_memory):
-    idx = replay_frame_indices(t, STRIDE, N_SHORT, max_memory)
-    return [idx.anchor] + idx.memory + idx.short + [idx.current], [True] + idx.memory_valid + idx.short_valid + [True]
+def python_window(t, max_memory, n_anchor=1):
+    idx = replay_frame_indices(t, STRIDE, N_SHORT, max_memory, n_anchor)
+    return (
+        idx.anchors + idx.memory + idx.short + [idx.current],
+        idx.anchor_valid + idx.memory_valid + idx.short_valid + [True],
+    )
 
 
 def as_dlataset(traj):
@@ -61,15 +64,17 @@ def synthetic_traj(T, A=7):
 # === TF transform mirrors the Python source of truth ==================================================================
 
 def test_tf_indices_match_python():
-    for max_memory in [4, 64]:
-        for T in [1, 2, 8, 9, 17, 40, 123, 505, 700]:
-            idx, valid = replay_window_indices(tf.constant(T), STRIDE, N_SHORT, max_memory)
-            idx, valid = idx.numpy(), valid.numpy()
-            assert idx.shape == (T, 1 + max_memory + N_SHORT), idx.shape
-            for t in range(T):
-                exp_idx, exp_valid = python_window(t, max_memory)
-                assert idx[t].tolist() == exp_idx, f"T={T}, M={max_memory}, t={t}: {idx[t].tolist()} != {exp_idx}"
-                assert valid[t].tolist() == exp_valid, f"T={T}, M={max_memory}, t={t}: validity differs"
+    for n_anchor in [1, 2, 3]:
+        for max_memory in [4, 64]:
+            for T in [1, 2, 8, 9, 17, 40, 123, 505, 700]:
+                idx, valid = replay_window_indices(tf.constant(T), STRIDE, N_SHORT, max_memory, n_anchor)
+                idx, valid = idx.numpy(), valid.numpy()
+                assert idx.shape == (T, n_anchor + max_memory + N_SHORT), idx.shape
+                for t in range(T):
+                    exp_idx, exp_valid = python_window(t, max_memory, n_anchor)
+                    where = f"A={n_anchor}, T={T}, M={max_memory}, t={t}"
+                    assert idx[t].tolist() == exp_idx, f"{where}: {idx[t].tolist()} != {exp_idx}"
+                    assert valid[t].tolist() == exp_valid, f"{where}: validity differs"
 
 
 def test_replay_chunk_obs_gathers_frames_and_current_action():
@@ -145,9 +150,9 @@ def stub_image_transform(img, size=8):
     return torch.full((6, size, size), float(np.asarray(img)[0, 0, 0]))
 
 
-def rlds_example(t, M):
+def rlds_example(t, M, n_anchor=1):
     """What the TF pipeline yields for step t after decoding: images whose pixel value = frame number."""
-    idx, valid = python_window(t, M)
+    idx, valid = python_window(t, M, n_anchor)
     return {
         "dataset_name": b"toy",
         "action": np.zeros((1, 7), dtype=np.float32),
@@ -160,20 +165,32 @@ def rlds_example(t, M):
     }
 
 
-def make_transform(M, image_transform=stub_image_transform):
+def make_transform(M, image_transform=stub_image_transform, n_anchor=1):
     tok = StubTokenizer()
-    return ReplayRLDSBatchTransform(ActionTokenizer(tok), tok, image_transform, PurePromptBuilder, n_short=N_SHORT, max_memory=M)
+    return ReplayRLDSBatchTransform(
+        ActionTokenizer(tok), tok, image_transform, PurePromptBuilder, n_short=N_SHORT, max_memory=M, n_anchor=n_anchor
+    )
 
 
 def test_batch_transform_splits_window():
     M, t = 4, 60   # grid < 60: 8..56 → short 40, 48, 56; memory 8, 16, 24, 32
     out = make_transform(M)(rlds_example(t, M))
     assert out["pixel_values"][0, 0, 0].item() == t % 256, "pixel_values must be the CURRENT frame"
-    assert out["anchor_pixel_values"][0, 0, 0].item() == 0
+    assert out["anchor_pixel_values"].shape[0] == 1 and out["anchor_pixel_values"][0, 0, 0, 0].item() == 0
     assert [int(x[0, 0, 0]) for x in out["short_pixel_values"]] == [40, 48, 56] and out["short_valid"].all()
     assert [int(x[0, 0, 0]) for x in out["memory_pixel_values"]] == [8, 16, 24, 32]
     assert out["memory_timesteps"].tolist() == [8, 16, 24, 32]
     assert (out["labels"] != -100).sum() > 0 and out["input_ids"][0] == 1
+
+
+def test_batch_transform_two_anchors():
+    M, t = 4, 60   # anchors 0, 8; grid < 60 after anchors: 16..56 → short 40, 48, 56; memory 16, 24, 32
+    out = make_transform(M, n_anchor=2)(rlds_example(t, M, n_anchor=2))
+    assert [int(x[0, 0, 0]) for x in out["anchor_pixel_values"]] == [0, 8] and out["anchor_valid"].all()
+    assert [int(x[0, 0, 0]) for x in out["short_pixel_values"]] == [40, 48, 56]
+    assert out["memory_timesteps"].tolist() == [16, 24, 32]
+    early = make_transform(M, n_anchor=2)(rlds_example(5, M, n_anchor=2))
+    assert early["anchor_valid"].tolist() == [True, False]
 
 
 def test_batch_transform_early_episode():
@@ -191,7 +208,8 @@ def test_collator_pads_memory_to_batch_max():
     assert batch["memory_pixel_values"].shape[:2] == (3, 4), batch["memory_pixel_values"].shape
     assert batch["memory_valid"].tolist() == [[False] * 4, [True, True, True, False], [True] * 4]
     assert batch["memory_timesteps"][2].tolist() == [8, 16, 24, 32]
-    assert batch["short_pixel_values"].shape[:2] == (3, N_SHORT - 1) and batch["anchor_pixel_values"].shape[0] == 3
+    assert batch["short_pixel_values"].shape[:2] == (3, N_SHORT - 1) and batch["anchor_pixel_values"].shape[:2] == (3, 1)
+    assert batch["anchor_valid"].tolist() == [[True]] * 3
     only_empty = ReplayCollator(model_max_length=2048, pad_token_id=0)([transform(rlds_example(3, M))])
     assert only_empty["memory_pixel_values"].shape[1] == 1 and not only_empty["memory_valid"].any()
 

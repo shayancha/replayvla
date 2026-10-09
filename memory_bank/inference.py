@@ -1,12 +1,21 @@
 """
 inference.py
 
-Closed-loop ReplayVLA inference (e.g. LIBERO eval). `ReplayMemoryBuffer` keeps an episode's frames and builds exactly
+Closed-loop ReplayVLA inference (e.g. LIBERO eval). `ReplayMemoryBuffer` keeps an episode's memory and builds exactly
 the memory inputs the model saw in training: frame selection comes from `replay_frame_indices`, the same function the
 training data pipeline mirrors.
 
-Cost: anchor + short-term frames are re-encoded every step (as in training, they go through the vision backbone with
-the current frame); memory frames are encoded ONCE, when they first become memory, and their patch features are cached.
+Cost per step, following MemoryWAM's cached inference:
+    - anchor + short-term frames go through the vision backbone with the current frame (as in training)
+    - when a grid frame becomes a memory frame, it is encoded ONCE (ViT -> GistEncoder.add_frame against the gist
+      encoder's key/value cache), and its pixels are dropped. Only its gists are kept; older gists are never recomputed.
+    - the gist encoder's cache holds the anchors, every past frame's gists, and the patches of only the newest
+      `gist_n_recent` memory frames (see memory_bank/gist_encoder.py)
+
+Like MemoryWAM, gists are never evicted: the LLM sees every memory frame's gists, however long the episode. These are
+exactly the gists training computes over the whole bank. (Training's `max_memory_frames` only sizes batches; LIBERO-10
+episodes need at most 61 memory frames at stride 8, so training never drops one either. A longer episode at eval would
+give the LLM more gist tokens than it saw in training.)
 
 Step counting: by default every policy step advances t (the eval loop's step counter after the simulator's warm-up).
 Training data (`*_no_noops`) dropped demo steps whose action was ~0 with an unchanged gripper; set `noop_threshold`
@@ -16,13 +25,14 @@ exact-zero test would almost never fire). See planning/PLAN.md, "Open issues".
 
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 from PIL import Image
 
-from .frame_indices import replay_frame_indices
+from .frame_indices import memory_frames_before, replay_frame_indices
+from .gist_encoder import GistCache
 from .modeling import ReplayVLAForActionPrediction
 
 
@@ -37,20 +47,23 @@ class ReplayMemoryBuffer:
         cfg = model.config
         self.model, self.device, self.dtype = model, device, dtype
         self.stride, self.n_short, self.max_memory = cfg.memory_stride, cfg.n_short, cfg.max_memory_frames
+        self.n_anchor = getattr(cfg, "n_anchor", 1)
         self.noop_threshold = noop_threshold
         self.reset()
 
     def reset(self) -> None:
         """Call at the start of every episode."""
         self.t = -1
-        self.pixels: Dict[int, torch.Tensor] = {}     # frame index -> [C, H, W] (anchor + grid frames still "short")
-        self.features: Dict[int, torch.Tensor] = {}   # frame index -> [P, vision_dim] (grid frames that became memory)
+        self.pixels: Dict[int, torch.Tensor] = {}     # frame index -> [C, H, W] (anchors + grid frames not yet memory)
+        self.cache: Optional[GistCache] = None        # gist encoder key/value cache (built at the first memory frame)
+        self.memory_frames: List[int] = []            # frames already in memory, oldest first
+        self.gists: List[torch.Tensor] = []           # their gists [G, gist_dim], computed once each
         self.prev_action: Optional[np.ndarray] = None
 
     def add_frame(self, pixel_values: torch.Tensor) -> int:
         """Register the current observation (processed pixels [C, H, W] or [1, C, H, W]); returns its step t."""
         self.t += 1
-        if self.t == 0 or self.t % self.stride == 0:   # the anchor, or a grid frame (needed later as short/memory)
+        if self.t % self.stride == 0:                  # a grid frame: anchor, or needed later as short/memory
             self.pixels[self.t] = pixel_values.reshape(-1, *pixel_values.shape[-2:]).to(self.device, self.dtype)
         return self.t
 
@@ -64,38 +77,45 @@ class ReplayMemoryBuffer:
         self.prev_action = np.asarray(action)
 
     @torch.no_grad()
-    def _memory_features(self, frame: int) -> torch.Tensor:
-        if frame not in self.features:
-            self.features[frame] = self.model._featurize(self.pixels[frame][None])[0]
-        return self.features[frame]
+    def _add_memory_frame(self, frame: int) -> None:
+        """Encode a frame that just entered memory: ViT once, then only its own gists against the cache."""
+        encoder = self.model.gist_encoder
+        if self.cache is None:   # all anchors exist by the time the first frame enters memory
+            anchors = [k * self.stride for k in range(self.n_anchor)]
+            features = self.model._featurize(torch.stack([self.pixels[f] for f in anchors]))[None]  # [1, A, P, Dv]
+            self.cache = encoder.init_cache(features, torch.tensor([anchors], device=self.device))
+        features = self.model._featurize(self.pixels.pop(frame)[None])                  # [1, P, vision_dim]
+        timestep = torch.tensor([frame], dtype=torch.long, device=self.device)
+        self.gists.append(encoder.add_frame(self.cache, features, timestep)[0])        # [G, gist_dim]
+        self.memory_frames.append(frame)
 
     def model_inputs(self) -> Dict[str, torch.Tensor]:
         """Memory kwargs for ReplayVLAForActionPrediction.forward / predict_action at the current step t."""
         assert self.t >= 0, "add_frame() first"
-        idx = replay_frame_indices(self.t, self.stride, self.n_short, self.max_memory)
+        idx = replay_frame_indices(self.t, self.stride, self.n_short, self.max_memory, self.n_anchor)
+        entered = memory_frames_before(self.t, self.stride, self.n_short, self.n_anchor)   # uncapped, oldest first
+        assert entered[: len(self.memory_frames)] == self.memory_frames, "memory frames must arrive in order"
+        for frame in entered[len(self.memory_frames) :]:
+            self._add_memory_frame(frame)
+
         zeros = torch.zeros_like(self.pixels[0])
-
+        anchors = torch.stack([self.pixels[f] if v else zeros for f, v in zip(idx.anchors, idx.anchor_valid)])
         short = torch.stack([self.pixels[f] if v else zeros for f, v in zip(idx.short, idx.short_valid)])
-        real_memory = [f for f, v in zip(idx.memory, idx.memory_valid) if v]
-        M = max(1, len(real_memory))                    # same padding rule as ReplayCollator
-        feats = torch.zeros(M, self.model.num_patches, self.model.vision_backbone.embed_dim, device=self.device, dtype=self.dtype)
-        timesteps = torch.zeros(M, dtype=torch.long, device=self.device)
-        valid = torch.zeros(M, dtype=torch.bool, device=self.device)
-        for slot, frame in enumerate(real_memory):
-            feats[slot] = self._memory_features(frame).to(self.dtype)
-            timesteps[slot], valid[slot] = frame, True
 
-        # Grid frames that are now memory no longer need their pixels (only their cached features)
-        for frame in [f for f in self.pixels if f != 0 and f in self.features]:
-            del self.pixels[frame]
-
+        frames = self.memory_frames                                                     # every gist, never evicted
+        if self.gists:
+            memory_gists = torch.stack(self.gists)                                      # [M, G, gist_dim]
+        else:                                                                           # same padding rule as ReplayCollator
+            enc = self.model.gist_encoder
+            memory_gists = torch.zeros(1, enc.n_gist, enc.d, device=self.device, dtype=self.dtype)
         return dict(
-            anchor_pixel_values=self.pixels[0][None],
+            anchor_pixel_values=anchors[None],
+            anchor_valid=torch.tensor([idx.anchor_valid], device=self.device),
             short_pixel_values=short[None],
             short_valid=torch.tensor([idx.short_valid], device=self.device),
-            memory_features=feats[None],
-            memory_valid=valid[None],
-            memory_timesteps=timesteps[None],
+            memory_gists=memory_gists[None],
+            memory_valid=torch.tensor([[True] * len(frames) or [False]], device=self.device),
+            memory_timesteps=torch.tensor([frames or [0]], dtype=torch.long, device=self.device),
         )
 
 

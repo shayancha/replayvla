@@ -14,7 +14,7 @@ from memory_bank.frame_indices import replay_frame_indices  # noqa: E402
 
 def test_episode_start():
     idx = replay_frame_indices(0, stride=8, n_short=4, max_memory=4)
-    assert idx.anchor == 0 and idx.current == 0
+    assert idx.anchors == [0] and idx.anchor_valid == [True] and idx.current == 0
     assert idx.short_valid == [False, False, False]
     assert idx.memory_valid == [False] * 4
 
@@ -62,6 +62,22 @@ def test_no_frame_repeats_and_all_before_t():
 def test_libero_long_fits_without_cap():
     idx = replay_frame_indices(505, stride=8, n_short=4, max_memory=64)  # longest LIBERO-10 demo
     assert sum(idx.memory_valid) == 63 - 3 and all(idx.short_valid)
+
+
+def test_two_anchors():
+    # Anchors 0 and 8 (MemoryWAM's 2 initial frames, on the stride-8 grid); frame 8 is never short or memory
+    for t in (0, 8):
+        idx = replay_frame_indices(t, stride=8, n_short=4, max_memory=4, n_anchor=2)
+        assert idx.anchors == [0, 0] and idx.anchor_valid == [True, False], f"t={t}: frame 8 is not in the past yet"
+    idx = replay_frame_indices(9, stride=8, n_short=4, max_memory=4, n_anchor=2)
+    assert idx.anchors == [0, 8] and idx.anchor_valid == [True, True] and not any(idx.short_valid)
+    idx = replay_frame_indices(50, stride=8, n_short=4, max_memory=4, n_anchor=2)   # grid < 50 after anchors: 16..48
+    assert idx.short == [32, 40, 48] and idx.memory == [16, 24, 0, 0] and idx.memory_valid == [True, True, False, False]
+
+
+def test_libero_long_fits_without_cap_two_anchors():
+    idx = replay_frame_indices(519, stride=8, n_short=4, max_memory=64, n_anchor=2)  # last eval step (max_steps 520)
+    assert sum(idx.memory_valid) == 64 - 1 - 3, "memory never hits the 64-frame cap on LIBERO-10"
 
 
 def test_fixed_grid_roles_are_stable():

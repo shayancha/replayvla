@@ -29,7 +29,7 @@ from .modeling import ReplayVLAForActionPrediction
 MEMORY_MODULES = ("gist_encoder", "gist_projector", "role_emb")
 MODEL_INPUT_KEYS = (
     "input_ids", "attention_mask", "pixel_values", "labels",
-    "anchor_pixel_values", "short_pixel_values", "short_valid",
+    "anchor_pixel_values", "anchor_valid", "short_pixel_values", "short_valid",
     "memory_pixel_values", "memory_valid", "memory_timesteps",
 )
 PIXEL_KEYS = ("pixel_values", "anchor_pixel_values", "short_pixel_values", "memory_pixel_values")
