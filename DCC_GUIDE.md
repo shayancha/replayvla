@@ -110,7 +110,7 @@ AUTO_RESUBMIT=1 RUN_NOTE=baseline sbatch slurm_scripts/train_replayvla.sbatch --
 - A **resumable checkpoint** (LoRA + memory modules + optimizer + step) is written every 30 min (`--checkpoint_interval_minutes`). It is also written when the job gets SIGTERM (preemption: ~30 s warning), and 15 min before the time limit (SIGUSR1 → STOP file). 
 - **Preemption:** Slurm requeues the job (`--requeue`), and it resumes from the checkpoint automatically.
 - **Time limit:** the job checkpoints, exits cleanly, and (with `AUTO_RESUBMIT=1`) submits the next one, which resumes.
-- A full merged model is also saved every 5,000 steps (`--save_steps`) into the run directory.
+- The job does **not** save merged models itself (`--merge_on_save False`): loading a second 7B copy in the job caused host-RAM OOMs. Merge offline when you want to evaluate (9b).
 
 ### Monitoring and control
 ```bash
@@ -143,7 +143,6 @@ source slurm_scripts/common.sh
 python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run>
 # -> /work/$USER/runs/<run>/merged-step<N>   (works for baseline runs too)
 ```
-Or use the merged model saved every 5,000 steps in the run directory itself.
 
 ### 9c. Run the eval (1 GPU, ≥24 GB; submit from the login node)
 ```bash
