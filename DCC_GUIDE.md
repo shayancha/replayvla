@@ -1,5 +1,52 @@
 # Running ReplayVLA on the Duke Compute Cluster (DCC)
 
+## Single H100 on this machine
+
+Use the local launcher from `/home/xz397/replayvla`. It uses the existing
+`/home/xz397/HardCode_VLAs_WAMs/.venv`, the LIBERO RLDS data under
+`/home/xz397/libero-gemm-run/libero_10/data`, and one H100. No package setup or
+asset download is needed after the first successful run.
+
+The default `RUN_NOTE=smoke-20261009` resumes the existing batch-1 run from its
+latest complete checkpoint. To continue it to step 50,000:
+
+```bash
+cd /home/xz397/replayvla
+bash scripts/train_h100.sh --max_steps 50000
+```
+
+To leave it running after closing the terminal, start it in a detached tmux
+session:
+
+```bash
+cd /home/xz397/replayvla
+mkdir -p logs
+tmux new-session -d -s replayvla-h100 'bash scripts/train_h100.sh --max_steps 50000 > logs/replayvla-h100.log 2>&1'
+```
+
+Monitor with `tail -f logs/replayvla-h100.log`, `tmux list-sessions`, and
+`nvidia-smi`. The current checkpointed step
+is in `runs/replayvla+openvla-7b+libero_10_no_noops+b1+lr-0.0005+lora-r32+mem64-s8-g8--smoke-20261009--image_aug/resume/trainer_state.json`.
+To request a clean stop after the next step, run:
+
+```bash
+touch /home/xz397/replayvla/runs/STOP-smoke-20261009
+```
+
+The trainer saves a resumable checkpoint every five minutes and on a clean stop.
+Run the same launcher again to resume. `--max_steps` is the total number of
+optimizer steps, including completed steps. Extra training options can be passed
+to the launcher. Set `REPLAYVLA_VENV`, `DATA_ROOT`, `RUN_ROOT`, `ADAPTER_TMP`, or
+`RUN_NOTE` to use another environment, dataset location, or run. A different
+`RUN_NOTE` starts a separate run; keep the note and batch size fixed when
+resuming this checkpoint. The local run uses batch 1 and does not perform the
+costly full-model merge during training. Use `vla-scripts/merge_replayvla.py`
+afterward if an evaluatable merged model is needed.
+
+The sections below describe the separate Slurm/H200 setup and its storage layout.
+
+---
+
 Guide covers setting up and running ReplayVLA, and a plain OpenVLA baseline, on DCC's H200 GPUs via Slurm. It goes from a fresh account to a training run and a LIBERO evaluation.
 
 ---

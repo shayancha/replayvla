@@ -151,6 +151,9 @@ data/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+/runs/
+/adapter-tmp/
+/logs/
 
 papers/
 planning/
