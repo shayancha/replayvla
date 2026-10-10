@@ -21,6 +21,7 @@
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:-$PWD}/slurm_scripts/common.sh"
 export TMPDIR=/tmp
+export PYTHONUNBUFFERED=1   # write every print to the log immediately, so tail -f shows live progress
 
 CKPT=${1:?usage: sbatch slurm_scripts/eval_libero.sbatch <CHECKPOINT_DIR> [TRIALS] [SUITE]}
 TRIALS=${2:-50}
