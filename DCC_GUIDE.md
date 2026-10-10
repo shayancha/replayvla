@@ -157,7 +157,7 @@ AUTO_RESUBMIT=1 RUN_NOTE=baseline sbatch slurm_scripts/train_replayvla.sbatch --
 - A **resumable checkpoint** (LoRA + memory modules + optimizer + step) is written every 30 min (`--checkpoint_interval_minutes`). It is also written when the job gets SIGTERM (preemption: ~30 s warning), and 15 min before the time limit (SIGUSR1 → STOP file). 
 - **Preemption:** Slurm requeues the job (`--requeue`), and it resumes from the checkpoint automatically.
 - **Time limit:** the job checkpoints, exits cleanly, and (with `AUTO_RESUBMIT=1`) submits the next one, which resumes.
-- A full merged model is also saved every 5,000 steps (`--save_steps`) into the run directory.
+- The job does **not** save merged models itself (`--merge_on_save False`): loading a second 7B copy in the job caused host-RAM OOMs. Merge offline when you want to evaluate (9b).
 
 ### Monitoring and control
 ```bash
@@ -190,14 +190,20 @@ source slurm_scripts/common.sh
 python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run>
 # -> /work/$USER/runs/<run>/merged-step<N>   (works for baseline runs too)
 ```
-Or use the merged model saved every 5,000 steps in the run directory itself.
+Training also keeps the trainable weights every 5,000 steps (`<run>/snapshots/step<N>`, ~0.6 GB each), so an earlier step can be evaluated too: add `--step <N>`, e.g. `--step 60000`.
 
-### 9c. Run the eval (1 GPU, ≥24 GB; submit from the login node)
+### 9c. Run the eval (submit from the login node)
+Split LIBERO-Long's 10 tasks across 2 H200 jobs (your 2-GPU allowance):
 ```bash
 cd /work/$USER/replayvla
-sbatch slurm_scripts/eval_libero.sbatch /work/$USER/runs/<run>/merged-step<N> 50            # ReplayVLA, 50 trials/task
-MODEL_FAMILY=openvla sbatch slurm_scripts/eval_libero.sbatch <baseline merged dir> 50        # baseline
+CKPT=/work/$USER/runs/<run>/merged-step<N>
+TASK_IDS=0-4 sbatch slurm_scripts/eval_libero.sbatch "$CKPT" 50     # 50 trials per task (the standard number)
+TASK_IDS=5-9 sbatch slurm_scripts/eval_libero.sbatch "$CKPT" 50
 ```
-It runs on a non-H200 GPU (`gpu:5000_ada`), so it doesn't use your H200 allowance. It may still wait while a training job holds your account's GPU limit. Results go to `/work/$USER/logs/libero_eval/EVAL-*.txt`, with per-task and total success rates. 50 trials × 10 tasks takes many hours; use e.g. `10` trials for a quick read.
+- Leave out `TASK_IDS` to run all 10 tasks in one job. Use e.g. `10` trials instead of `50` for a quick read (it gets its own results).
+- Baseline: `MODEL_FAMILY=openvla TASK_IDS=0-4 sbatch slurm_scripts/eval_libero.sbatch <baseline merged dir> 50` (and `5-9`).
+- **Preemption is handled:** each finished episode is saved immediately, and the requeued job skips finished episodes. Rerunning the same command also resumes.
+- **Results:** `/work/$USER/logs/libero_eval/RESULTS-libero_10-<family>--<run>--merged-step<N>/SUMMARY.txt` has per-task and total success rates, combined across both jobs (it says how many episodes are done so far). Live progress: `tail -f /work/$USER/logs/replayvla-eval-<jobid>.out`. Rollout videos: `/work/$USER/replayvla/rollouts/`.
+- To use a non-H200 GPU instead: `sbatch --account=<account> --partition=gpu-common --gres=gpu:5000_ada:1 slurm_scripts/eval_libero.sbatch ...`
 
 ---

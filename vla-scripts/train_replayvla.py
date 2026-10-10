@@ -50,6 +50,7 @@ from memory_bank.training import (
     load_resume_checkpoint,
     merge_lora,
     save_resume_checkpoint,
+    save_snapshot,
     sync_any,
     upcast_memory_modules,
     wrap_with_lora,
@@ -61,6 +62,21 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def job_memory_gb() -> float:
+    """RAM used by this Slurm job's cgroup (all ranks + data pipeline), in GB; falls back to this process's RSS."""
+    try:
+        cgroup = open("/proc/self/cgroup").read().strip().split("::")[-1]
+        path = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+        for p in [path, *path.parents]:          # walk up to the job-level cgroup (step -> job)
+            if p.name.startswith("job_") and (p / "memory.current").exists():
+                return int((p / "memory.current").read_text()) / 2**30
+        return int((path / "memory.current").read_text()) / 2**30
+    except Exception:
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 
 
 @dataclass
@@ -90,6 +106,7 @@ class ReplayTrainConfig:
     batch_size: int = 8                                             # Per-GPU batch size
     max_steps: int = 50_000                                         # Max number of gradient steps
     save_steps: int = 5_000                                         # Checkpoint interval (gradient steps)
+    keep_snapshots: bool = True                                     # Keep the adapter at every save_steps (~0.6 GB)
     learning_rate: float = 5e-4
     grad_accumulation_steps: int = 1
     image_aug: bool = True
@@ -302,7 +319,8 @@ def train(cfg: ReplayTrainConfig) -> None:
                     f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] step {completed_steps}/{cfg.max_steps} | "
                     f"loss {window['loss'] / n:.4f} | action acc {window['action_accuracy'] / n:.3f} | "
                     f"L1 {window['l1_loss'] / n:.4f} | mem frames {window['memory_frames'] / n:.1f} | "
-                    f"{sec_per_step:.2f} s/step | ETA {int(eta_h)}h{int((eta_h % 1) * 60):02d}m",
+                    f"{sec_per_step:.2f} s/step | ETA {int(eta_h)}h{int((eta_h % 1) * 60):02d}m | "
+                    f"RAM {job_memory_gb():.0f} GB",
                     flush=True,
                 )
                 window = {k: 0.0 for k in window} | {"n": 0}
@@ -338,6 +356,8 @@ def save_merged(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, step, di
         print(f"Saving checkpoint for step {step}")
         processor.save_pretrained(run_dir)
         vla.module.save_pretrained(adapter_dir)      # LoRA adapter + full memory modules
+        if cfg.keep_snapshots:                       # evaluate this step later: merge_replayvla.py --step <N>
+            print(f"Kept snapshot {save_snapshot(adapter_dir, run_dir, step)}", flush=True)
     dist.barrier()
 
     if cfg.merge_on_save and distributed_state.is_main_process:

@@ -7,8 +7,11 @@ export TMPDIR=/tmp   # node-local: pip wheel builds in /work (NFS) fail with .nf
 LIBERO_DIR="$WORK_DIR/LIBERO"
 [[ -d "$LIBERO_DIR" ]] || git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git "$LIBERO_DIR"
 python -m pip install -e "$LIBERO_DIR"
-# bddl must be 1.0.1 (LIBERO's own pin); unpinned it resolves to an unrelated 3.x release
-python -m pip install -r "$REPO_DIR/experiments/robot/libero/libero_requirements.txt" "bddl==1.0.1"
+# bddl must be 1.0.1 (LIBERO's own pin); unpinned it resolves to an unrelated 3.x release. bddl 1.0.1 imports the
+# Python 2/3 compatibility package `future` without declaring it, so install that explicitly. robosuite 1.4.1 needs a
+# MuJoCo of its era: newer releases (e.g. 3.15) fail its joint-type check (AssertionError in get_joint_qpos_addr)
+python -m pip install -r "$REPO_DIR/experiments/robot/libero/libero_requirements.txt" \
+    "bddl==1.0.1" "future==1.0.0" "mujoco==3.1.6"
 # Same pins as setup_env.sh, in case the installs above moved them
 # recent opencv-python (incl. late 4.x) needs numpy>=2; TF 2.15 needs <2: pin 4.10
 python -m pip install "tensorflow-metadata==1.17.1" "protobuf==4.21.12" "numpy==1.26.4" "opencv-python==4.10.0.84"

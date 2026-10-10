@@ -1,11 +1,12 @@
 """
 merge_replayvla.py
 
-Turn a training run's latest resumable checkpoint (LoRA adapter + memory modules) into a standalone ReplayVLA checkpoint
+Turn a training run's latest resumable checkpoint (LoRA adapter + memory modules), or with --step N the snapshot kept
+at that step (runs keep one every save_steps), into a standalone ReplayVLA checkpoint
 (or, for a `--use_memory False` baseline run, a standalone OpenVLA checkpoint: evaluate it with --model_family openvla)
 for evaluation: base model + adapter -> merged weights, plus the run's dataset statistics and processor.
 
-    python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run> [--out_dir <dir>]
+    python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run> [--step <N>] [--out_dir <dir>]
 """
 
 import json
@@ -19,20 +20,24 @@ import torch
 from transformers import AutoProcessor
 
 from memory_bank.modeling import register_replayvla
-from memory_bank.training import find_resume_checkpoint, merge_lora
+from memory_bank.training import find_resume_checkpoint, find_snapshot, merge_lora
 
 
 @dataclass
 class MergeConfig:
     run_dir: Path
     out_dir: Optional[Path] = None          # default: <run_dir>/merged-step<N>
+    step: Optional[int] = None              # merge snapshots/step<N> instead of the latest resumable checkpoint
 
 
 @draccus.wrap()
 def main(cfg: MergeConfig) -> None:
     register_replayvla()
-    ckpt = find_resume_checkpoint(cfg.run_dir)
-    assert ckpt is not None, f"no complete resumable checkpoint in {cfg.run_dir}"
+    if cfg.step is not None:
+        ckpt = find_snapshot(cfg.run_dir, cfg.step)
+    else:
+        ckpt = find_resume_checkpoint(cfg.run_dir)
+        assert ckpt is not None, f"no complete resumable checkpoint in {cfg.run_dir}"
     step = json.loads((ckpt / "trainer_state.json").read_text())["completed_steps"]
     config_path = cfg.run_dir / "replayvla_config.json"
     run_cfg = json.loads(config_path.read_text()) if config_path.exists() else {"vla_path": "openvla/openvla-7b"}

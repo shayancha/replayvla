@@ -4,7 +4,7 @@
 #SBATCH --partition=scavenger-h200
 #SBATCH --gres=gpu:h200:2
 #SBATCH --cpus-per-task=48                # 24 per GPU (H200 nodes: 192 CPUs / 8 GPUs); data loading is CPU-heavy
-#SBATCH --mem=256G
+#SBATCH --mem=400G                       # job 58128865 hit 256G (OOM); H200 node share for 2 GPUs ~512G
 #SBATCH --time=24:00:00
 #SBATCH --requeue                       # preemption = cancel + requeue: the requeued job resumes from the checkpoint
 #SBATCH --signal=B:USR1@900             # 15 min before the time limit, SIGUSR1 to this script -> checkpoint + exit
@@ -27,6 +27,7 @@
 set -uo pipefail
 source "${SLURM_SUBMIT_DIR:-$PWD}/slurm_scripts/common.sh"
 export TMPDIR=/tmp   # node-local: temp files on /work (NFS) hit .nfs* "Directory not empty" races
+export MALLOC_ARENA_MAX=4      # limit glibc arena fragmentation from variable-size image tensors (RAM creep)
 export TF_CPP_MIN_LOG_LEVEL=3   # hide TF C++ startup noise ("Unable to register cuDNN factory", ...)
 # TF's graph optimizer also prints harmless "op_level_cost_estimator ... Error in PredictCost()" warnings via a logger
 # that TF_CPP_MIN_LOG_LEVEL does not control; drop just those lines from stderr (see torchrun below)
@@ -75,6 +76,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NUM_GPUS" vla-scripts/train_
     --stop_file "$STOP_FILE" \
     --checkpoint_interval_minutes "$CHECKPOINT_MIN" \
     --wandb_mode "$WANDB_MODE" \
+    --merge_on_save False \
     "$@" 2> >(grep --line-buffered -v -E "$TF_NOISE" >&2) &
 TRAIN_PID=$!
 
