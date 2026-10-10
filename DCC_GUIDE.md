@@ -2,46 +2,98 @@
 
 ## Single H100 on this machine
 
-Use the local launcher from `/home/xz397/replayvla`. It uses the existing
+Use `scripts/updated_train_h100.sh` from `/home/xz397/replayvla`. It uses the existing
 `/home/xz397/HardCode_VLAs_WAMs/.venv`, the LIBERO RLDS data under
 `/home/xz397/libero-gemm-run/libero_10/data`, and one H100. No package setup or
 asset download is needed after the first successful run.
 
-The default `RUN_NOTE=smoke-20261009` resumes the existing batch-1 run from its
-latest complete checkpoint. To continue it to step 50,000:
+It trains with exactly the recipe of the DCC ReplayVLA run, so the two can be compared:
+an effective batch of 16 (8 per step x 2 gradient-accumulation steps on one GPU; DCC uses
+2 GPUs x 8), learning rate 5e-4, LoRA rank 32, image augmentation, a 20,000-example
+shuffle buffer, and 50,000 steps. By default it trains the **vanilla OpenVLA baseline**
+(no memory); `USE_MEMORY=True` trains ReplayVLA instead.
 
-```bash
-cd /home/xz397/replayvla
-bash scripts/train_h100.sh --max_steps 50000
-```
+The older `scripts/train_h100.sh` ran with batch 1 and a 64-example shuffle buffer (and
+memory on), so its `smoke-20261009` run is not comparable with the DCC run. Don't resume it.
 
-To leave it running after closing the terminal, start it in a detached tmux
-session:
+### Start training
+
+Start it in a detached tmux session so it keeps running after the terminal closes:
 
 ```bash
 cd /home/xz397/replayvla
 mkdir -p logs
-tmux new-session -d -s replayvla-h100 'bash scripts/train_h100.sh --max_steps 50000 > logs/replayvla-h100.log 2>&1'
+tmux new-session -d -s baseline-h100 'bash scripts/updated_train_h100.sh > logs/baseline-h100.log 2>&1'
 ```
 
-Monitor with `tail -f logs/replayvla-h100.log`, `tmux list-sessions`, and
-`nvidia-smi`. The current checkpointed step
-is in `runs/replayvla+openvla-7b+libero_10_no_noops+b1+lr-0.0005+lora-r32+mem64-s8-g8--smoke-20261009--image_aug/resume/trainer_state.json`.
-To request a clean stop after the next step, run:
+This starts a new run in
+`runs/openvla-baseline+openvla-7b+libero_10_no_noops+b16+lr-0.0005+lora-r32--baseline-h100--image_aug`.
+`b16` in the name confirms the batch size. If the GPU has room, `PER_STEP_BATCH=16 GRAD_ACCUM=1`
+(set before `bash`) gives the same batch of 16 faster; the script refuses any combination that
+doesn't multiply to 16.
+
+### Monitor
 
 ```bash
-touch /home/xz397/replayvla/runs/STOP-smoke-20261009
+tail -f logs/baseline-h100.log    # live progress; Ctrl-C stops tail, not the training
+tmux list-sessions                # baseline-h100 is listed while it trains
+nvidia-smi
 ```
 
-The trainer saves a resumable checkpoint every five minutes and on a clean stop.
-Run the same launcher again to resume. `--max_steps` is the total number of
-optimizer steps, including completed steps. Extra training options can be passed
-to the launcher. Set `REPLAYVLA_VENV`, `DATA_ROOT`, `RUN_ROOT`, `ADAPTER_TMP`, or
-`RUN_NOTE` to use another environment, dataset location, or run. A different
-`RUN_NOTE` starts a separate run; keep the note and batch size fixed when
-resuming this checkpoint. The local run uses batch 1 and does not perform the
-costly full-model merge during training. Use `vla-scripts/merge_replayvla.py`
-afterward if an evaluatable merged model is needed.
+The first lines should include `use_memory=False run_note=baseline-h100 batch 8x2=16` and
+`Training OpenVLA baseline (no memory)`. After a few minutes (the shuffle buffer fills first),
+a progress line appears every 50 steps. The loss starts around 3.5 and should fall steadily.
+For reference, the DCC ReplayVLA run was at loss ~2.2 at step 7,000, ~1.1 at 28,000 and ~0.35
+at 50,000. A loss still around 3.5 after ~5,000 steps means something is wrong.
+
+The current checkpointed step is in `runs/<run>/resume/trainer_state.json`.
+
+### Stop, resume, continue
+
+```bash
+touch /home/xz397/replayvla/runs/STOP-baseline-h100     # clean stop: checkpoint, then exit
+```
+
+Run the same tmux command again to resume from the last checkpoint. The trainer saves a
+resumable checkpoint every 30 minutes and on a clean stop. To train further, pass the new
+total (it continues the same run):
+
+```bash
+tmux new-session -d -s baseline-h100 'bash scripts/updated_train_h100.sh --max_steps 75000 >> logs/baseline-h100.log 2>&1'
+```
+
+Keep the other settings unchanged when resuming: a different `RUN_NOTE`, batch size or
+`USE_MEMORY` starts a separate run. Paths can be changed with `REPLAYVLA_VENV`, `DATA_ROOT`,
+`RUN_ROOT` and `ADAPTER_TMP`.
+
+### Evaluate
+
+Every 5,000 steps the trainer also keeps a copy of the trained weights in
+`runs/<run>/snapshots/step<N>` (~0.6 GB each), so any of those steps can be evaluated.
+Merge the latest checkpoint, or a snapshot with `--step`, into a standalone model:
+
+```bash
+python vla-scripts/merge_replayvla.py --run_dir runs/<run>                 # -> runs/<run>/merged-step<N>
+python vla-scripts/merge_replayvla.py --run_dir runs/<run> --step 40000    # an earlier step
+```
+
+Then run the LIBERO eval on it with the same settings as on DCC (`--model_family openvla` for
+the baseline, `replayvla` for a memory run). The venv needs the LIBERO simulator, installed as in
+`slurm_scripts/setup_libero.sh`, including its `future` and `mujoco==3.1.6` pins (newer MuJoCo
+releases crash robosuite):
+
+```bash
+python experiments/robot/libero/run_libero_eval.py --model_family openvla \
+    --pretrained_checkpoint runs/<run>/merged-step<N> --task_suite_name libero_10 \
+    --num_trials_per_task 50 --center_crop True --local_log_dir logs/libero_eval \
+    --run_id_note baseline-h100-step<N>
+```
+
+Success rates (per task and total) are written to
+`logs/libero_eval/RESULTS-libero_10-openvla--baseline-h100-step<N>/SUMMARY.txt`, and a rerun of
+the same command skips episodes that already finished. Give every model its own
+`--run_id_note`: the results folder is named after it, and evals with the same note share
+(and skip) each other's episodes.
 
 The sections below describe the separate Slurm/H200 setup and its storage layout.
 
