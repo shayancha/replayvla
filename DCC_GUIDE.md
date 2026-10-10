@@ -143,6 +143,7 @@ source slurm_scripts/common.sh
 python vla-scripts/merge_replayvla.py --run_dir /work/$USER/runs/<run>
 # -> /work/$USER/runs/<run>/merged-step<N>   (works for baseline runs too)
 ```
+Training also keeps the trainable weights every 5,000 steps (`<run>/snapshots/step<N>`, ~0.6 GB each), so an earlier step can be evaluated too: add `--step <N>`, e.g. `--step 60000`.
 
 ### 9c. Run the eval (submit from the login node)
 Split LIBERO-Long's 10 tasks across 2 H200 jobs (your 2-GPU allowance):

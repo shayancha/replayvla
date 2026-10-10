@@ -223,6 +223,38 @@ def test_resume_checkpoint_round_trip():
         assert find_resume_checkpoint(run_dir) == run_dir / "resume.old.x"
 
 
+def test_snapshots_keep_the_adapter_per_step():
+    from memory_bank.training import find_snapshot, save_snapshot
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir, adapter_dir, run_dir = Path(tmp) / "base", Path(tmp) / "adapter", Path(tmp) / "run"
+        save_tiny_openvla(base_dir)
+        torch.manual_seed(0)
+        vla = wrap_with_lora(load_replayvla(base_dir, memory_kwargs=MEMORY_KWARGS, torch_dtype=torch.float32), rank=4)
+        with torch.no_grad():
+            vla.base_model.model.role_emb.modules_to_save["default"].weight.fill_(0.5)
+        vla.save_pretrained(adapter_dir)
+        snap = save_snapshot(adapter_dir, run_dir, 5000)
+        assert snap == run_dir / "snapshots" / "step5000" and find_snapshot(run_dir, 5000) == snap
+
+        # The adapter dir is overwritten at the next save; the snapshot keeps step 5000's weights
+        with torch.no_grad():
+            vla.base_model.model.role_emb.modules_to_save["default"].weight.fill_(-1.0)
+        vla.save_pretrained(adapter_dir)
+        save_snapshot(adapter_dir, run_dir, 10000)
+        merged = merge_lora(base_dir, snap / "adapter", memory_kwargs=MEMORY_KWARGS, torch_dtype=torch.float32)
+        assert torch.all(merged.role_emb.weight == 0.5), "the snapshot must hold the weights of its own step"
+        assert not list((run_dir / "snapshots").glob(".tmp-*")), "temporary snapshot dirs left behind"
+
+        # Missing step: a clear error listing what exists; an incomplete leftover is not used
+        (run_dir / "snapshots" / "step15000").mkdir()
+        try:
+            find_snapshot(run_dir, 15000)
+            raise AssertionError("an incomplete snapshot was accepted")
+        except FileNotFoundError as e:
+            assert "[5000, 10000]" in str(e), str(e)
+
+
 def test_stop_request_signals_and_file():
     import os
     import signal

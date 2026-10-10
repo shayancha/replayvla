@@ -174,6 +174,40 @@ def save_resume_checkpoint(peft_model, optimizer, trainer_state: Dict, run_dir: 
     return final
 
 
+# === Snapshots: the trainable weights at fixed steps, kept so earlier checkpoints can be evaluated later ===
+# The resumable checkpoint is overwritten every save. A snapshot is a copy of just the adapter (LoRA + memory modules,
+# ~0.6 GB for the 7B model; no optimizer state), at <run_dir>/snapshots/step<N>. Merge one with
+# `vla-scripts/merge_replayvla.py --run_dir <run> --step <N>`.
+SNAPSHOT_DIR = "snapshots"
+
+
+def save_snapshot(adapter_dir: Union[str, Path], run_dir: Union[str, Path], step: int) -> Path:
+    import json
+    import shutil
+    import uuid
+
+    final = Path(run_dir) / SNAPSHOT_DIR / f"step{step}"
+    if (final / "COMPLETE").exists():
+        return final
+    tmp = final.parent / f".tmp-step{step}.{uuid.uuid4().hex[:8]}"
+    shutil.copytree(adapter_dir, tmp / "adapter")                # creates the parent directories too
+    (tmp / "trainer_state.json").write_text(json.dumps({"completed_steps": step}))
+    (tmp / "COMPLETE").touch()
+    if final.exists():                                           # an incomplete leftover from a killed job
+        _best_effort_rmtree(final)
+    tmp.rename(final)
+    return final
+
+
+def find_snapshot(run_dir: Union[str, Path], step: int) -> Path:
+    root = Path(run_dir) / SNAPSHOT_DIR
+    path = root / f"step{step}"
+    if not (path / "COMPLETE").exists():
+        done = sorted(int(p.name[4:]) for p in root.glob("step*") if (p / "COMPLETE").exists()) if root.exists() else []
+        raise FileNotFoundError(f"no snapshot for step {step} in {root}; available steps: {done}")
+    return path
+
+
 def find_resume_checkpoint(run_dir: Union[str, Path]) -> Optional[Path]:
     """The complete checkpoint to resume from: `resume/`, or, if a kill landed between the two renames, the newest
     complete `resume.old.*`. Partial `resume.tmp.*` directories are never used."""

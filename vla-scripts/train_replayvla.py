@@ -50,6 +50,7 @@ from memory_bank.training import (
     load_resume_checkpoint,
     merge_lora,
     save_resume_checkpoint,
+    save_snapshot,
     sync_any,
     upcast_memory_modules,
     wrap_with_lora,
@@ -105,6 +106,7 @@ class ReplayTrainConfig:
     batch_size: int = 8                                             # Per-GPU batch size
     max_steps: int = 50_000                                         # Max number of gradient steps
     save_steps: int = 5_000                                         # Checkpoint interval (gradient steps)
+    keep_snapshots: bool = True                                     # Keep the adapter at every save_steps (~0.6 GB)
     learning_rate: float = 5e-4
     grad_accumulation_steps: int = 1
     image_aug: bool = True
@@ -354,6 +356,8 @@ def save_merged(cfg, vla, processor, vla_dataset, run_dir, adapter_dir, step, di
         print(f"Saving checkpoint for step {step}")
         processor.save_pretrained(run_dir)
         vla.module.save_pretrained(adapter_dir)      # LoRA adapter + full memory modules
+        if cfg.keep_snapshots:                       # evaluate this step later: merge_replayvla.py --step <N>
+            print(f"Kept snapshot {save_snapshot(adapter_dir, run_dir, step)}", flush=True)
     dist.barrier()
 
     if cfg.merge_on_save and distributed_state.is_main_process:
