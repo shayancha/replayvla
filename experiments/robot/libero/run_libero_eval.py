@@ -25,12 +25,14 @@ Resumable + splittable (ReplayVLA addition):
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import draccus
 import numpy as np
+import torch
 import tqdm
 from libero.libero import benchmark
 
@@ -107,10 +109,10 @@ def parse_task_ids(spec: Optional[str], n_tasks: int) -> List[int]:
     return sorted(set(ids))
 
 
-def load_results(results_dir: str, task_id: int, num_trials: int) -> Dict[int, bool]:
-    """episode index -> success, for finished episodes (a line cut off by a preemption is ignored)."""
+def load_records(results_dir: str, task_id: int, num_trials: int) -> Dict[int, Dict]:
+    """episode index -> its record, for finished episodes (a line cut off by a preemption is ignored)."""
     path = os.path.join(results_dir, f"task{task_id:02d}.jsonl")
-    results = {}
+    records = {}
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
@@ -119,8 +121,13 @@ def load_results(results_dir: str, task_id: int, num_trials: int) -> Dict[int, b
                 except json.JSONDecodeError:
                     continue
                 if record["episode"] < num_trials:
-                    results[record["episode"]] = bool(record["success"])
-    return results
+                    records[record["episode"]] = record
+    return records
+
+
+def load_results(results_dir: str, task_id: int, num_trials: int) -> Dict[int, bool]:
+    """episode index -> success, for finished episodes."""
+    return {i: bool(r["success"]) for i, r in load_records(results_dir, task_id, num_trials).items()}
 
 
 def record_result(results_dir: str, task_id: int, record: Dict) -> None:
@@ -143,6 +150,18 @@ def write_summary(results_dir: str, n_tasks: int, num_trials: int, descriptions:
         lines.append(f"task {task_id}: {k}/{n} = {k / n * 100:.1f}%  {descriptions.get(task_id, '')}{status}")
     lines.append(f"TOTAL: {successes}/{total} = {successes / max(total, 1) * 100:.1f}%"
                  + ("" if total == n_tasks * num_trials else f"   ({total}/{n_tasks * num_trials} episodes done)"))
+
+    # Timing (episodes recorded with timing fields only; evals from before timing was added have none)
+    timed = [r for task_id in range(n_tasks) for r in load_records(results_dir, task_id, num_trials).values()
+             if "model_s" in r]
+    if timed:
+        model_s, calls = sum(r["model_s"] for r in timed), sum(r["model_calls"] for r in timed)
+        wall_s, steps = sum(r["wall_s"] for r in timed), sum(r["steps"] for r in timed)
+        lines.append(
+            f"TIMING ({len(timed)} episodes): model {model_s / max(calls, 1) * 1000:.1f} ms/call over {calls} calls | "
+            f"episode wall {wall_s / steps * 1000:.1f} ms/step, {wall_s / len(timed):.1f} s/episode | "
+            f"model share {model_s / max(wall_s, 1e-9) * 100:.0f}%"
+        )
     text = "\n".join(lines) + "\n"
     tmp = os.path.join(results_dir, f".SUMMARY.{os.getpid()}.tmp")
     with open(tmp, "w") as f:
@@ -258,6 +277,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             t = 0
             done = False
             replay_images = []
+            episode_start, model_s, model_calls = time.perf_counter(), 0.0, 0
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -295,7 +315,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         ),
                     }
 
-                    # Query model to get action
+                    # Query model to get action (timed: everything inside the policy call, GPU work included)
+                    call_start = time.perf_counter()
                     action = get_action(
                         cfg,
                         model,
@@ -303,6 +324,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    model_s += time.perf_counter() - call_start
+                    model_calls += 1
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -327,7 +352,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             task_episodes += 1
             total_episodes += 1
-            record_result(cfg.results_dir, task_id, {"episode": episode_idx, "success": bool(done), "steps": t})
+            wall_s = time.perf_counter() - episode_start
+            record_result(cfg.results_dir, task_id, {
+                "episode": episode_idx, "success": bool(done), "steps": t,
+                "wall_s": round(wall_s, 3), "model_s": round(model_s, 3), "model_calls": model_calls,
+                "model_ms_per_call": round(model_s / max(model_calls, 1) * 1000, 2),
+            })
             write_summary(cfg.results_dir, num_tasks_in_suite, cfg.num_trials_per_task, descriptions)
 
             # Save a replay video of the episode
