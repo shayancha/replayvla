@@ -95,7 +95,7 @@ class ReplayTrainConfig:
     memory_stride: int = 8
     n_short: int = 4
     max_memory_frames: int = 64
-    n_anchor: int = 2                                               # anchor frames 0, s, … in full (MemoryWAM: 2)
+    n_anchor: int = 1                                               # anchor frames 0, s, … in full (MemoryWAM: 2)
     n_gist: int = 8
     gist_dim: int = 1024
     gist_depth: int = 4

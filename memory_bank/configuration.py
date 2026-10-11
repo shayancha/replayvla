@@ -22,8 +22,8 @@ class ReplayVLAConfig(OpenVLAConfig):
         gist_heads: int = 16,
         gist_n_recent: int = 3,             # frames before i whose full patches frame i's gists may see
         gist_max_timestep: int = 1024,      # size of the learned timestep embedding table
-        n_anchor: int = 1,                  # anchor frames 0, s, … kept in full (default 1 so configs saved before
-                                            # this field existed load unchanged; new training runs default to 2)
+        n_anchor: int = 1,                  # anchor frames 0, s, … kept in full (1 = frame 0 only; 2 = MemoryWAM's
+                                            # two initial frames, frames 0 and s)
         **kwargs,
     ) -> None:
         self.memory_stride, self.n_short, self.max_memory_frames = memory_stride, n_short, max_memory_frames
