@@ -1,0 +1,11 @@
+task 0: 35/50 = 70.0%  put both the alphabet soup and the tomato sauce in the basket
+task 1: 45/50 = 90.0%  put both the cream cheese box and the butter in the basket
+task 2: 40/50 = 80.0%  turn on the stove and put the moka pot on it
+task 3: 30/50 = 60.0%  put the black bowl in the bottom drawer of the cabinet and close it
+task 4: 30/50 = 60.0%  put the white mug on the left plate and put the yellow and white mug on the right plate
+task 5: 46/50 = 92.0%  pick up the book and place it in the back compartment of the caddy
+task 6: 32/50 = 64.0%  put the white mug on the plate and put the chocolate pudding to the right of the plate
+task 7: 40/50 = 80.0%  put both the alphabet soup and the cream cheese box in the basket
+task 8: 22/50 = 44.0%  put both moka pots on the stove
+task 9: 30/50 = 60.0%  put the yellow and white mug in the microwave and close it
+TOTAL: 350/500 = 70.0%

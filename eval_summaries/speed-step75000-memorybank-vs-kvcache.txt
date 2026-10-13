@@ -1,0 +1,21 @@
+LIBERO-Long eval speed: ReplayVLA step-75k checkpoint (merged-step75000), memory bank vs KV-cache eval
+Same weights, same settings (50 trials/task, 2 jobs x 1 H200, tasks 0-4 and 5-9). Only the eval code differs:
+  memory bank = replayvla-memory @ a03bf2c (gist encoder reruns over all memory frames every step)
+  kv cache    = gist-kv-cache @ 9f2b62a (each memory frame's gists computed once, then reused)
+
+ms/step = Slurm job elapsed time / env steps recorded in the results (task*.jsonl "steps", incl. the 10 wait steps).
+Includes everything: model load, 7B LLM, ViT, gist encoder, simulator, rendering.
+
+eval          job        tasks   elapsed   env steps   ms/step   success
+memory bank   58368090   0-4     5.29 h    86,435      220       180/250
+memory bank   58368104   5-9     5.23 h    87,170      216       172/250
+kv cache      58388020   0-4     5.15 h    85,920      216       180/250
+kv cache      58388021   5-9     5.16 h    87,481      212       170/250
+
+Totals: memory bank 70.4% (352/500), kv cache 70.0% (350/500).
+Speedup: ~4 ms/step (~2%). The gist encoder is a small part of each step; the 7B LLM (~2,000 tokens), the ViT on the
+current + anchor + 3 short-term frames, and the simulator dominate. The two jobs of one eval ran on different nodes,
+which alone differ by ~2%, so the speed difference is near the noise level.
+
+Evals from gist-kv-cache @ 1e4996c onward also record wall_s / model_s / model_calls per episode and a TIMING line in
+SUMMARY.txt, which measures the model's own time per call directly.
