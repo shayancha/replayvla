@@ -46,4 +46,7 @@ fi
 # LIBERO (eval) has no top-level libero/__init__.py, so its editable install is not importable with current setuptools;
 # put the repo on PYTHONPATH instead. Must come AFTER `module load Anaconda3`, which overwrites PYTHONPATH.
 export PYTHONPATH="$WORK_DIR/LIBERO${PYTHONPATH:+:$PYTHONPATH}"
+# The env has the repo pip-installed in editable mode, pointing at $WORK_DIR/replayvla. Putting $REPO_DIR first makes
+# a second checkout (e.g. REPO_DIR=/work/$USER/replayvla-kv, a git worktree of another branch) run its OWN code.
+export PYTHONPATH="$REPO_DIR:$PYTHONPATH"
 cd "$REPO_DIR"
